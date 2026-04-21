@@ -1,7 +1,7 @@
 """
-pytest11 plugin for vllm-spyre-next.
+pytest11 plugin for spyre-inference.
 
-This plugin integrates upstream vLLM tests with vLLM-spyre-next
+This plugin integrates upstream vLLM tests with spyre-inference
 and filtering via a declarative YAML config (upstream_tests.yaml).
 
 Hook Execution Order
@@ -45,7 +45,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from vllm_spyre_next.testing.models import (
+from spyre_inference.testing.models import (
     AllowEntry,
     BlockEntry,
     FileConfig,
@@ -574,7 +574,7 @@ def _spyre_default_vllm_config(monkeypatch):
     monkeypatch.setattr(type(current_platform), "_enum", PlatformEnum.OOT)
 
     # Explicitly register custom ops
-    from vllm_spyre_next.custom_ops import register_all
+    from spyre_inference.custom_ops import register_all
 
     register_all()
 

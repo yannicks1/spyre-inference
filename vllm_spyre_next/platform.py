@@ -40,7 +40,7 @@ class TorchSpyrePlatform(CpuPlatform):
     # Register the PyTorch Native Attention implementation as the CUSTOM backend
     register_backend(
         AttentionBackendEnum.CUSTOM,
-        "vllm_spyre_next.v1.attention.backends.spyre_attn.SpyreAttentionBackend",
+        "spyre_inference.v1.attention.backends.spyre_attn.SpyreAttentionBackend",
     )
 
     @classmethod
@@ -75,7 +75,7 @@ class TorchSpyrePlatform(CpuPlatform):
 
         message = logo_template.substitute(colors)
 
-        version = importlib.metadata.version("vllm_spyre_next")
+        version = importlib.metadata.version("spyre_inference")
 
         model_name = vllm_config.model_config.model if vllm_config.model_config else "N/A"
 
@@ -97,7 +97,7 @@ class TorchSpyrePlatform(CpuPlatform):
         if parallel_config.worker_cls == "auto":
             # "auto" defaults to the CPUWorker as we inherit from the CpuPlatform
             # Override with TorchSpyreWorker for Spyre-specific functionality
-            worker_class = "vllm_spyre_next.v1.worker.spyre_worker.TorchSpyreWorker"
+            worker_class = "spyre_inference.v1.worker.spyre_worker.TorchSpyreWorker"
             logger.info("Loading worker from: %s", worker_class)
             parallel_config.worker_cls = worker_class
 
@@ -112,7 +112,7 @@ class TorchSpyrePlatform(CpuPlatform):
         # default scheduler
         scheduler_class = "vllm.v1.core.sched.scheduler.Scheduler"
         # if a torch spyre specific scheduler class is needed it can be loaded with
-        # scheduler_class = "vllm_spyre_next.v1.core.scheduler.TorchSpyreScheduler"
+        # scheduler_class = "spyre_inference.v1.core.scheduler.TorchSpyreScheduler"
         logger.info("Loading scheduler from: %s", scheduler_class)
         scheduler_config.scheduler_cls = scheduler_class
 

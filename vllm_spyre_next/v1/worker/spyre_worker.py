@@ -4,7 +4,7 @@ from vllm.config import VllmConfig
 from vllm.v1.worker.cpu_worker import CPUWorker
 from vllm.logger import init_logger
 
-from vllm_spyre_next.custom_ops import register_all
+from spyre_inference.custom_ops import register_all
 
 logger = init_logger(__name__)
 

@@ -9271,7 +9271,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "vllm-spyre-next"
+name = "spyre-inference"
 source = { editable = "." }
 dependencies = [
     { name = "torch", version = "2.10.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine != 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'darwin'" },

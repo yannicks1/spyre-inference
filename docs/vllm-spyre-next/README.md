@@ -1,8 +1,8 @@
-# vLLM-Spyre-Next
+# spyre-inference
 
 ## Overview
 
-The `vllm-spyre-next` plugin represents the next iteration of vLLM-Spyre, built on the `torch-spyre` stack. This plugin integrates with `torch-spyre` to leverage the PyTorch Inductor backend for model compilation, providing enhanced performance and optimization capabilities for large language model inference.
+The `spyre-inference` plugin represents the next iteration of vLLM-Spyre, built on the `torch-spyre` stack. This plugin integrates with `torch-spyre` to leverage the PyTorch Inductor backend for model compilation, providing enhanced performance and optimization capabilities for large language model inference.
 
 ## Key Features
 
@@ -17,14 +17,14 @@ The plugin registers itself as a vLLM platform plugin through the entry point:
 
 ```python
 [project.entry-points."vllm.platform_plugins"]
-spyre_next = "vllm_spyre_next:register"
+spyre_next = "spyre_inference:register"
 ```
 
 This allows vLLM to automatically discover and load the plugin, enabling torch-spyre-based compilation and execution.
 
 ## Getting Started
 
-To get started with vllm-spyre-next, see the [Installation Guide](getting_started/installation.md).
+To get started with spyre-inference, see the [Installation Guide](getting_started/installation.md).
 
 ## Documentation
 

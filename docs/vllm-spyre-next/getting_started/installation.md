@@ -1,6 +1,6 @@
 # Installation
 
-This guide covers the installation of `vllm-spyre-next` using `uv`, a fast Python package installer and resolver.
+This guide covers the installation of `spyre-inference` using `uv`, a fast Python package installer and resolver.
 
 ## Prerequisites
 
@@ -10,11 +10,11 @@ This guide covers the installation of `vllm-spyre-next` using `uv`, a fast Pytho
 
 ## Installation with uv sync
 
-The `vllm-spyre-next` plugin uses `uv` for dependency management and installation. The project configuration in `vllm_spyre_next/pyproject.toml` includes several important settings that ensure proper installation:
+The `spyre-inference` plugin uses `uv` for dependency management and installation. The project configuration in `spyre_inference/pyproject.toml` includes several important settings that ensure proper installation:
 
 ### Basic Installation
 
-From the `vllm_spyre_next` directory, run:
+From the `spyre_inference` directory, run:
 
 ```bash
 uv sync --frozen
@@ -72,7 +72,7 @@ We ensure that the cpu flavor of pytorch is installed, as we're not building cud
 After installation, verify the plugin is correctly installed:
 
 ```bash
-python -c "import vllm_spyre_next; print(vllm_spyre_next.__version__)"
+python -c "import spyre_inference; print(spyre_inference.__version__)"
 ```
 
 ## Development Installation
@@ -97,4 +97,4 @@ If you encounter build failures:
 
 ## Next Steps
 
-After installation, you can start using vllm-spyre-next with your vLLM applications. The plugin will automatically be loaded by vLLM when the appropriate platform is detected.
+After installation, you can start using spyre-inference with your vLLM applications. The plugin will automatically be loaded by vLLM when the appropriate platform is detected.

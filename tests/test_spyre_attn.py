@@ -5,7 +5,7 @@ import pytest
 import torch
 
 from vllm.utils.torch_utils import set_random_seed
-from vllm_spyre_next.v1.attention.backends.spyre_attn import (
+from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionImpl,
     SpyreAttentionMetadata,
 )

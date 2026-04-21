@@ -21,14 +21,14 @@ Check out the [Installation Guide](../getting_started/installation.md) for instr
 
 ## Testing
 
-The project includes both local tests (located in `vllm_spyre_next/tests/`) for vllm-spyre-next specific functionality, and upstream vLLM tests automatically cloned from the vLLM repository at the commit specified in `pyproject.toml`, for compatibility verification.
+The project includes both local tests (located in `spyre_inference/tests/`) for spyre-inference specific functionality, and upstream vLLM tests automatically cloned from the vLLM repository at the commit specified in `pyproject.toml`, for compatibility verification.
 
 ### Test Markers
 
 The test suite uses pytest markers to categorize tests:
 
 ```python
---8<-- "vllm_spyre_next/pyproject.toml:test-markers-definition"
+--8<-- "spyre_inference/pyproject.toml:test-markers-definition"
 ```
 
 By default, `pytest` runs tests marked `spyre` or `upstream_passing`. Some useful overrides:

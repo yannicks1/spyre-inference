@@ -42,7 +42,7 @@ def test_spyre_rmsnorm_matches_reference(
     - forward_oot(): OOT dispatch via custom op (torch.ops.vllm.spyre_rmsnorm)
     - reference_rms_norm(): golden reference, similar to vLLM upstream pure PyTorch (ground truth)
     """
-    from vllm_spyre_next.custom_ops.rms_norm import SpyreRMSNorm
+    from spyre_inference.custom_ops.rms_norm import SpyreRMSNorm
 
     eps = 1e-6
     torch.manual_seed(42)
@@ -88,7 +88,7 @@ def mock_forward_oot_with_residual(x, residual=None):
 def test_rmsnorm_oot_dispatch(default_vllm_config, monkeypatch, dummy_tensor, use_residual):
     """Verify RMSNorm OOT registration: class swap and forward_oot routing."""
     from vllm.model_executor.layers.layernorm import RMSNorm
-    from vllm_spyre_next.custom_ops.rms_norm import SpyreRMSNorm
+    from spyre_inference.custom_ops.rms_norm import SpyreRMSNorm
 
     layer = RMSNorm(128, eps=1e-6)
 
