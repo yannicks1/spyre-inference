@@ -2,7 +2,7 @@
 
 ## Overview
 
-The `spyre-inference` plugin represents the next iteration of vLLM-Spyre, built on the `torch-spyre` stack. This plugin integrates with `torch-spyre` to leverage the PyTorch Inductor backend for model compilation, providing enhanced performance and optimization capabilities for large language model inference.
+The `spyre-inference` plugin represents the next iteration of sendnn-inference, built on the `torch-spyre` stack. This plugin integrates with `torch-spyre` to leverage the PyTorch Inductor backend for model compilation, providing enhanced performance and optimization capabilities for large language model inference.
 
 ## Key Features
 
