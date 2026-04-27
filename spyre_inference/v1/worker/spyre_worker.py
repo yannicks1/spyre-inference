@@ -6,8 +6,8 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.v1.worker.cpu_worker import CPUWorker
 
-from vllm_spyre_next.custom_ops import register_all
-from vllm_spyre_next.v1.worker.spyre_model_runner import TorchSpyreModelRunner
+from spyre_inference.custom_ops import register_all
+from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
 
 logger = init_logger(__name__)
 

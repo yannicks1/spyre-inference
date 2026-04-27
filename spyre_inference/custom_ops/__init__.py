@@ -15,7 +15,7 @@ logger = init_logger(__name__)
 
 @lru_cache(maxsize=1)
 def register_all():
-    logger.info("Registering custom ops for spyre_next")
+    logger.info("Registering custom ops for spyre_inference")
     vocab_parallel_embedding.register()
     parallel_lm_head.register()
     rotary_embedding.register()

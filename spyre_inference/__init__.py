@@ -6,17 +6,17 @@ from typing import Any
 from vllm.envs import VLLM_CONFIGURE_LOGGING, VLLM_LOGGING_CONFIG_PATH
 from vllm.logger import DEFAULT_LOGGING_CONFIG
 
-__version__ = importlib.metadata.version("vllm_spyre_next")
+__version__ = importlib.metadata.version("spyre_inference")
 
 
 def register():
     """Register the Spyre platform."""
-    return "vllm_spyre_next.platform.TorchSpyrePlatform"
+    return "spyre_inference.platform.TorchSpyrePlatform"
 
 
 def register_ops():
     """Register OOT custom ops for Spyre."""
-    from vllm_spyre_next.custom_ops import register_all
+    from spyre_inference.custom_ops import register_all
 
     register_all()
 
@@ -35,29 +35,29 @@ def _init_logging():
 
     if VLLM_CONFIGURE_LOGGING:
         # Copy the vLLM logging configurations for our package
-        if "vllm_spyre_next" not in config["formatters"]:
+        if "spyre_inference" not in config["formatters"]:
             if "vllm" in config["formatters"]:
-                config["formatters"]["vllm_spyre_next"] = config["formatters"]["vllm"]
+                config["formatters"]["spyre_inference"] = config["formatters"]["vllm"]
             else:
-                config["formatters"]["vllm_spyre_next"] = DEFAULT_LOGGING_CONFIG["formatters"][
+                config["formatters"]["spyre_inference"] = DEFAULT_LOGGING_CONFIG["formatters"][
                     "vllm"
                 ]
 
-        if "vllm_spyre_next" not in config["handlers"]:
+        if "spyre_inference" not in config["handlers"]:
             if "vllm" in config["handlers"]:
                 handler_config = config["handlers"]["vllm"]
             else:
                 handler_config = DEFAULT_LOGGING_CONFIG["handlers"]["vllm"]
-            handler_config["formatter"] = "vllm_spyre_next"
-            config["handlers"]["vllm_spyre_next"] = handler_config
+            handler_config["formatter"] = "spyre_inference"
+            config["handlers"]["spyre_inference"] = handler_config
 
-        if "vllm_spyre_next" not in config["loggers"]:
+        if "spyre_inference" not in config["loggers"]:
             if "vllm" in config["loggers"]:
                 logger_config = config["loggers"]["vllm"]
             else:
                 logger_config = DEFAULT_LOGGING_CONFIG["loggers"]["vllm"]
-            logger_config["handlers"] = ["vllm_spyre_next"]
-            config["loggers"]["vllm_spyre_next"] = logger_config
+            logger_config["handlers"] = ["spyre_inference"]
+            config["loggers"]["spyre_inference"] = logger_config
 
     dictConfig(config)
 

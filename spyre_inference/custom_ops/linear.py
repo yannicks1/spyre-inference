@@ -23,7 +23,7 @@ Spyre Device Constraints:
 
 References:
     - Upstream linear layers: vllm/model_executor/layers/linear.py
-    - Pattern reference:      vllm_spyre_next/custom_ops/rms_norm.py
+    - Pattern reference:      spyre_inference/custom_ops/rms_norm.py
 """
 
 import torch

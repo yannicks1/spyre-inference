@@ -1,4 +1,4 @@
-# Contributing to vLLM Spyre Next
+# Contributing to Spyre Inference
 
 Thank you for your interest in contributing to the Spyre plugin for vLLM! There are several ways you can contribute:
 
@@ -21,14 +21,14 @@ Check out the [Installation Guide](../getting_started/installation.md) for instr
 
 ## Testing
 
-The project includes both local tests (located in `vllm_spyre_next/tests/`) for vllm-spyre-next specific functionality, and upstream vLLM tests automatically cloned from the vLLM repository at the commit specified in `pyproject.toml`, for compatibility verification.
+The project includes both local tests (located in `spyre_inference/tests/`) for spyre-inference specific functionality, and upstream vLLM tests automatically cloned from the vLLM repository at the commit specified in `pyproject.toml`, for compatibility verification.
 
 ### Test Markers
 
 The test suite uses pytest markers to categorize tests:
 
 ```python
---8<-- "vllm_spyre_next/pyproject.toml:test-markers-definition"
+--8<-- "spyre_inference/pyproject.toml:test-markers-definition"
 ```
 
 By default, `pytest` runs tests marked `spyre` or `upstream_passing`. Some useful overrides:
@@ -49,7 +49,7 @@ pytest -m "upstream and not upstream_passing"
 
 ### Upstream Test Integration
 
-Upstream tests are cloned from the vLLM repository at the commit pinned in `pyproject.toml`, fetching only the `tests/` directory. Cloned tests are cached in `~/.cache/vllm-upstream-tests` (or `$XDG_CACHE_HOME/vllm-upstream-tests`) with separate worktrees per commit, allowing multiple vLLM versions to be tested simultaneously. All upstream tests run with `VLLM_PLUGINS=spyre_next` set automatically. See `tests/conftest.py` for implementation details.
+Upstream tests are cloned from the vLLM repository at the commit pinned in `pyproject.toml`, fetching only the `tests/` directory. Cloned tests are cached in `~/.cache/vllm-upstream-tests` (or `$XDG_CACHE_HOME/vllm-upstream-tests`) with separate worktrees per commit, allowing multiple vLLM versions to be tested simultaneously. All upstream tests run with `VLLM_PLUGINS=spyre_inference` set automatically. See `tests/conftest.py` for implementation details.
 
 !!! tip
     To force a re-clone, remove `~/.cache/vllm-upstream-tests`.

@@ -11,7 +11,7 @@ from typing import ClassVar
 
 import torch
 
-from vllm_spyre_next.custom_ops.utils import convert
+from spyre_inference.custom_ops.utils import convert
 
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType

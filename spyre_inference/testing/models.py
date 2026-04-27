@@ -1,4 +1,4 @@
-"""Data models for the vllm-spyre-next test infrastructure."""
+"""Data models for the spyre-inference test infrastructure."""
 
 from __future__ import annotations
 
