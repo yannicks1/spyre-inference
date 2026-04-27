@@ -23,13 +23,13 @@ requires-python = ">=3.11"
 dynamic = ["version"]
 
 [project.entry-points."vllm.platform_plugins"]
-spyre_next = "spyre_inference:register"
+spyre_inference = "spyre_inference:register"
 
 [project.entry-points."vllm.general_plugins"]
-spyre_next_ops = "spyre_inference:register_ops"
+spyre_inference_ops = "spyre_inference:register_ops"
 
 [project.entry-points."pytest11"]
-spyre_next_test = "spyre_inference.testing.pytest_plugin"
+spyre_inference_test = "spyre_inference.testing.pytest_plugin"
 
 [tool.setuptools.packages.find]
 where = ["."]  # list of folders that contain the packages (["."] by default)

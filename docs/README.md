@@ -17,7 +17,7 @@ The plugin registers itself as a vLLM platform plugin through the entry point:
 
 ```python
 [project.entry-points."vllm.platform_plugins"]
-spyre_next = "spyre_inference:register"
+spyre_inference = "spyre_inference:register"
 ```
 
 This allows vLLM to automatically discover and load the plugin, enabling torch-spyre-based compilation and execution.
