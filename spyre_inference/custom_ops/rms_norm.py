@@ -57,7 +57,7 @@ class SpyreRMSNorm(RMSNorm):
     def __init__(self, *args, **kwargs):
         """Initialize SpyreRMSNorm layer.
 
-        Compiles the Spyre kernel based on VLLM_SPYRE_NEXT_RMSNORM_KERNEL
+        Compiles the Spyre kernel based on SPYRE_INFERENCE_RMSNORM_KERNEL
         environment variable and registers this instance in static_forward_context.
         """
         super().__init__(*args, **kwargs)

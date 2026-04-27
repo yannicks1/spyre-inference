@@ -1,4 +1,4 @@
-# Contributing to vLLM Spyre Next
+# Contributing to Spyre Inference
 
 Thank you for your interest in contributing to the Spyre plugin for vLLM! There are several ways you can contribute:
 
