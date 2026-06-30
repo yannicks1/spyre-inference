@@ -17,8 +17,9 @@
 Applies rotary position embeddings on the Spyre device using a complex-free
 2x2 rotation-matrix formulation (ported from foundation-model-stack, so there
 is no dependency on `fms`). The rotation runs eagerly on Spyre (like the other
-Spyre custom ops); the frequency cache is indexed on CPU -- Spyre has no eager
-index_select -- and only the gathered slice is moved to Spyre.
+Spyre custom ops). The 2x2 rotation cache is kept Spyre-resident; the per-token
+gather is a one-hot matmul (``sel @ cache``) -- Spyre has no eager index_select,
+so the one-hot selector is built on CPU and transferred.
 
 Set ``SPYRE_INFERENCE_ROPE_DEVICE=cpu`` to fall back to the previous CPU
 implementation ``RotaryEmbedding.forward_native``.
@@ -95,33 +96,48 @@ class SpyreRotaryEmbedding(RotaryEmbedding):
             and self.rotary_dim == self.head_size
             and (self.rotary_dim // 2) % _SPYRE_STICK == 0
         )
+        # Flattened 2x2 rotation cache [aligned_max_pos, 2*rotary_dim], built lazily.
         self._rotation_cache: torch.Tensor | None = None
-        # Per-forward-pass caching of the gathered+transferred rotation slice
+        self._aligned_max_pos: int | None = None
+        # Per-forward-pass caching of the selected rotation slice
         self._rotation_cache_slice: torch.Tensor | None = None
         self._rotation_cache_key: tuple | None = None
 
     def _apply(self, fn, recurse=True):
-        # Keep cos_sin_cache on CPU so forward_native can use it directly.
-        # rotation_cache (spyre implemenation) is a plain CPU attribute and is
-        # not a registered buffer, hence so it is unaffected here.
+        # Keep cos_sin_cache on CPU so forward_native (CPU fallback) can use it
+        # directly and so the rotation cache can be derived from it. _rotation_cache
+        # is a plain attribute (not a registered buffer) that we place on Spyre
+        # ourselves, so it is unaffected here.
         return self
 
-    def _get_rotation_cache(self) -> torch.Tensor:
-        """Lazily build the CPU 2x2 rotation cache from cos_sin_cache.
+    def _get_rotation_cache(self, device, dtype) -> torch.Tensor:
+        """Lazily build the Spyre-resident 2x2 rotation cache from cos_sin_cache.
 
-        cos_sin_cache is [max_pos, rotary_dim] = cat((cos, sin)); reshape into
-        [max_pos, 2, 2, rotary_dim//2] rotation matrices [[cos, -sin], [sin, cos]].
+        cos_sin_cache is [max_pos, rotary_dim] = cat((cos, sin)). We form the 2x2
+        rotation matrices [[cos, -sin], [sin, cos]] and flatten the trailing dims to
+        [max_pos, 2*rotary_dim] -- the right operand of the one-hot matmul gather.
+        The position dim is zero-padded up to a multiple of the stick size so the
+        gather matmul's contraction dim is stick-aligned (padded rows are never
+        selected by the one-hot, so they contribute zeros). The result is moved to
+        ``device``; the matching ``view(T, 2, 2, rotary_dim//2)`` happens post-gather.
         """
         # ToDO ysc: need to make sure to trigger this in model warmup before serving a model.
-        if self._rotation_cache is None:
-            cpu_cache = convert(self.cos_sin_cache, device="cpu", dtype=torch.float32)
-            assert cpu_cache is not None
-            cos, sin = cpu_cache.chunk(2, dim=-1)  # [max_pos, Dr/2]
-            self._rotation_cache = (
-                torch.stack([cos, -sin, sin, cos], dim=1)
-                .view(cpu_cache.shape[0], 2, 2, self.rotary_dim // 2)
-                .to(self.dtype)
-            )
+        if (
+            self._rotation_cache is not None
+            and self._rotation_cache.device == device
+            and self._rotation_cache.dtype == dtype
+        ):
+            return self._rotation_cache
+        cpu_cache = convert(self.cos_sin_cache, device="cpu", dtype=torch.float32)
+        assert cpu_cache is not None
+        cos, sin = cpu_cache.chunk(2, dim=-1)  # [max_pos, Dr/2]
+        max_pos = cpu_cache.shape[0]
+        self._aligned_max_pos = ((max_pos + _SPYRE_STICK - 1) // _SPYRE_STICK) * _SPYRE_STICK
+        # [max_pos, 4, Dr/2] -> [max_pos, 2*rotary_dim] (4 * Dr/2 == 2*rotary_dim)
+        rot = torch.stack([cos, -sin, sin, cos], dim=1).reshape(max_pos, 2 * self.rotary_dim)
+        if self._aligned_max_pos > max_pos:
+            rot = torch.nn.functional.pad(rot, (0, 0, 0, self._aligned_max_pos - max_pos))
+        self._rotation_cache = convert(rot, device=device, dtype=dtype)
         return self._rotation_cache
 
     def forward_oot(
@@ -152,11 +168,11 @@ class SpyreRotaryEmbedding(RotaryEmbedding):
                 else None,
             )
 
-        # new implementation: do rotation on Spyre, but keep cache on CPU.
-        # Gather the per-token rotation matrices on CPU (Spyre has no eager
-        # index_select) and move the slice to Spyre for the first attention layer.
-        # Keep the slice on device and reuse for later attention layers as positions
-        # are shared accross the layers (detection via cache_key below).
+        # new implementation: rotation cache lives on Spyre; gather the per-token
+        # rotation matrices with a one-hot matmul (sel @ cache). Spyre has no eager
+        # index_select, so the one-hot selector is built on CPU and transferred.
+        # The gathered slice is memoized and reused across attention layers, which share
+        # positions within a forward pass (detection via cache_key below).
         cpu_positions = convert(positions, device="cpu")
         assert cpu_positions is not None
         cpu_positions = cpu_positions.flatten()
@@ -164,8 +180,16 @@ class SpyreRotaryEmbedding(RotaryEmbedding):
         if self._rotation_cache_slice is not None and self._rotation_cache_key == cache_key:
             rot = self._rotation_cache_slice
         else:
-            selected = self._get_rotation_cache().index_select(0, cpu_positions)
-            rot = convert(selected, device=target_device, dtype=target_dtype)
+            cache_flat = self._get_rotation_cache(target_device, target_dtype)
+            num_tokens = cpu_positions.shape[0]
+            # One-hot selector built on CPU: sel[t, positions[t]] = 1.
+            sel = torch.zeros(num_tokens, self._aligned_max_pos, dtype=self.dtype)
+            sel[torch.arange(num_tokens), cpu_positions] = 1.0
+            # move to Spyre
+            sel_dev = convert(sel, device=target_device, dtype=target_dtype)
+            # [T, aligned_max_pos] @ [aligned_max_pos, 2*rotary_dim] -> [T, 2*rotary_dim]
+            rot_flat = torch.matmul(sel_dev, cache_flat)
+            rot = rot_flat.view(num_tokens, 2, 2, self.rotary_dim // 2)
             self._rotation_cache_slice = rot
             self._rotation_cache_key = cache_key
         # move q/k to the device (a real transfer only on the first layer;
