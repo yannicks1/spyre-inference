@@ -81,14 +81,14 @@ def test_llama3_rotary_oot_registration(default_vllm_config):
 @pytest.mark.rotary
 @pytest.mark.parametrize("head_size", HEAD_SIZES)
 def test_rotation_math_matches_reference_cpu(default_vllm_config, head_size):
-    """CPU-only: gather_rotation + _rotate_neox_2x2 match forward_native without a
+    """CPU-only: gather_rotation + _apply_rope_matmul match forward_native without a
     Spyre device, so the core rotation formula is validated on dev laptops where the
     forward_oot tests skip. Stick-aligned inner dims (128->64, 256->128) exercise the
-    pure-view path; head_size=64 (inner dim 32) exercises the pad-to-stick expand-matrix
-    path."""
+    pure-view path; head_size=64 (inner dim 32) exercises the pad-to-stick
+    expand/contract path."""
     from vllm.model_executor.layers.rotary_embedding import get_rope
     from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
-    from spyre_inference.custom_ops.rotary_embedding import _rotate_neox_2x2
+    from spyre_inference.custom_ops.rotary_embedding import _apply_rope_matmul
 
     torch.manual_seed(11)
     max_position, num_tokens, num_heads = 2048, 32, 4
@@ -100,8 +100,8 @@ def test_rotation_math_matches_reference_cpu(default_vllm_config, head_size):
 
     rot = rope.gather_rotation(positions, torch.device("cpu"))
     assert rot is not None and rot.device.type == "cpu"
-    actual_query = _rotate_neox_2x2(query, rot, head_size)
-    actual_key = _rotate_neox_2x2(key, rot, head_size)
+    actual_query = _apply_rope_matmul(query, rot, head_size)
+    actual_key = _apply_rope_matmul(key, rot, head_size)
 
     expected_query, expected_key = RotaryEmbedding.forward_native(rope, positions, query, key)
     torch.testing.assert_close(actual_query.float(), expected_query.float(), atol=1e-2, rtol=1e-2)
