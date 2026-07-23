@@ -15,12 +15,15 @@
 """Spyre OOT replacement for RotaryEmbedding.
 
 Applies rotary position embeddings on the Spyre device via a complex-free 2x2
-rotation-matrix formulation (ported from foundation-model-stack). The frequency
-cache is index_select'd on CPU (Spyre has no eager index_select):
-``_SpyreModelWrapper`` calls ``gather_rotation`` before the model forward, moves
-the gathered slice to Spyre, and stashes it in the vLLM forward context;
-``forward_oot`` fetches it through the opaque ``spyre_rope_rot`` op (keeping the
-forward-context read out of torch.compile graphs) and applies the rotation.
+rotation-matrix formulation (ported from foundation-model-stack / hf-adapters
+``apply_rope_matmul``). The frequency cache is index_select'd on CPU (Spyre has no
+eager index_select): ``_SpyreModelWrapper`` calls ``gather_rotation`` before the
+model forward, moves the gathered slice to Spyre, and stashes it in the vLLM
+forward context; ``forward_oot`` fetches it through the opaque ``spyre_rope_rot``
+op (keeping the forward-context read out of torch.compile graphs) and applies the
+rotation. For the pad-to-stick case (``head_size // 2 < 64``) Q/K are expanded to
+the stick-aligned width, rotated, then contracted back with a matmul
+(``x @ exp`` ... ``out @ con``) -- avoiding a sub-stick strided slice + copy.
 
 Only neox-style full rotary is supported; other configs raise
 ``NotImplementedError`` at construction instead of silently falling back to CPU.
@@ -55,45 +58,54 @@ _SPYRE_STICK = 64
 
 
 @lru_cache
-def _get_expand_matrix(
+def _get_expand_contract(
     inner: int, padded: int, device: torch.device, dtype: torch.dtype
-) -> torch.Tensor:
-    """Constant ``{0, 1}`` matrix ``E`` [2*inner, 2*padded] that zero-pads each neox
-    half up to the stick-aligned ``padded`` on-device via ``x @ E`` (so the sub-stick
-    ``[.,2,inner]`` view is never materialized). Cached per ``(inner, padded, device, dtype)``.
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Constant expand/contract matrix pair that stick-aligns the neox halves.
+
+    ``exp`` is the ``{0, 1}`` matrix [2*inner, 2*padded] that maps each neox half up to
+    the stick-aligned ``padded`` on-device via ``x @ exp`` (zero-filling the pad lanes);
+    ``con = exp.T`` [2*padded, 2*inner] contracts the rotated result back to the original
+    width. Cached per ``(inner, padded, device, dtype)``.
     """
     e = torch.zeros(2 * inner, 2 * padded, dtype=dtype)
     idx = torch.arange(inner)
     e[idx, idx] = 1
     e[inner + idx, padded + idx] = 1
-    return convert(e, device=device, dtype=dtype)
+    return (
+        convert(e, device=device, dtype=dtype),
+        convert(e.t().contiguous(), device=device, dtype=dtype),
+    )
 
 
-def _rotate_neox_2x2(
+def _apply_rope_matmul(
     x: torch.Tensor,
     rot: torch.Tensor,
     head_size: int,
 ) -> torch.Tensor:
-    """Apply full neox RoPE via per-token 2x2 rotation matrices.
+    """Apply full neox RoPE via per-token 2x2 rotation matrices (contract variant).
 
-    ``x`` is [T, H*head_size] or [T, H, head_size]; ``rot`` is [T, 2, 2, padded]
-    with ``padded >= head_size // 2``. When the inner dim head_size//2 is stick-aligned
-    the split-half pairing is a pure view; otherwise each half is zero-padded to
-    ``padded`` on-device with a constant matmul so the pairing-axis stride is aligned.
-    Returns the rotated tensor with ``x``'s shape.
+    ``x`` is [T, H*head_size] or [T, H, head_size]; ``rot`` is [T, 2, 2, padded] with
+    ``padded >= head_size // 2``. When head_size//2 is stick-aligned the split-half
+    pairing is a pure view; otherwise Q/K are expanded to ``2*padded`` (``x @ exp``),
+    rotated, then contracted back to head_size with ``out @ con`` -- so no sub-stick
+    strided slice is materialized. Returns the rotated tensor with ``x``'s shape.
     """
+    orig_shape = x.shape
     num_tokens = x.shape[0]
     inner = head_size // 2
     padded = rot.shape[-1]
+    xv = x.view(num_tokens, -1, head_size)
+    con: torch.Tensor | None = None
     if padded != inner:
-        e = _get_expand_matrix(inner, padded, x.device, x.dtype)
-        x_pairs = (x.view(num_tokens, -1, head_size) @ e).view(num_tokens, -1, 2, padded)
-    else:
-        x_pairs = x.view(num_tokens, -1, 2, inner)
-    out = (rot.unsqueeze(1) * x_pairs.unsqueeze(-3)).sum(dim=-2)
-    if padded != inner:
-        out = out[..., :inner].contiguous()  # non-contiguous slice; copy before reshape
-    return out.flatten(-2).view(x.shape)
+        exp, con = _get_expand_contract(inner, padded, x.device, x.dtype)
+        xv = xv @ exp  # [T, H, 2*padded]
+    x_pairs = xv.reshape(num_tokens, -1, 2, padded)  # [T, H, 2, padded]
+    out = (rot.unsqueeze(1) * x_pairs.unsqueeze(-3)).sum(dim=-2)  # [T, H, 2, padded]
+    out = out.flatten(-2)  # [T, H, 2*padded]
+    if con is not None:
+        out = out @ con  # contract back to [T, H, head_size]
+    return out.reshape(orig_shape)
 
 
 class _SpyreRotaryMixin:
@@ -165,8 +177,8 @@ class _SpyreRotaryMixin:
             self.head_size,
         )
         # query/key arrive on Spyre from the QKV projection; rot is primed on Spyre.
-        out_query = _rotate_neox_2x2(query, rot, self.head_size)
-        out_key = _rotate_neox_2x2(key, rot, self.head_size) if key is not None else None
+        out_query = _apply_rope_matmul(query, rot, self.head_size)
+        out_key = _apply_rope_matmul(key, rot, self.head_size) if key is not None else None
         return out_query, out_key
 
 
