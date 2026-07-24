@@ -189,5 +189,79 @@ def test_non_aligned_weight_is_padded(tp_group):
     assert torch.all(layer.padded_weight[63:] == 0)
 
 
+@pytest.mark.parallel_lm_head
+@pytest.mark.parametrize("scale", [1.0, 1.0 / 6.0, 2.0])
+def test_spyre_logits_processor_scaling(tp_group, spyre_or_cpu_device, scale):
+    """SpyreLogitsProcessor matches upstream reference for logits_scaling.
+
+    Granite 3.3 sets logits_scaling, which causes the downstream
+    `logits *= self.scale` in LogitsProcessor.forward. SpyreLogitsProcessor
+    forces logits.contiguous() so the in-place mul does not hit a torch-spyre
+    compile issue on a transposed/non-contiguous tensor.
+    """
+
+    from vllm.model_executor.layers.logits_processor import LogitsProcessor
+    from spyre_inference.custom_ops.logits_processor import SpyreLogitsProcessor
+
+    torch.manual_seed(42)
+
+    vocab_size = 32000
+    embedding_dim = 4096
+    num_tokens = 8
+
+    torch.manual_seed(43)
+    # Small random values keep logits in a range where fp16 accumulation-order
+    # differences between CPU and Spyre matmuls do not dominate the tolerance.
+    weight = torch.randn(vocab_size, embedding_dim, dtype=torch.float16) * 0.01
+
+    # Minimal fake LM head: just a linear weight with the right interface.
+    class FakeLMHead:
+        def __init__(self, weight_tensor):
+            self.weight = weight_tensor
+            self.shard_indices = type(
+                "SI", (), {"num_org_vocab_padding": 0, "org_vocab_start_index": 0}
+            )()
+            self.quant_method = type(
+                "QM",
+                (),
+                {"apply": lambda self, layer, x, bias=None: F.linear(x, layer.weight, bias)},
+            )()
+
+    weight_device = weight.to(spyre_or_cpu_device)
+    fake_head = FakeLMHead(weight_device)
+
+    processor = LogitsProcessor(
+        vocab_size=vocab_size,
+        org_vocab_size=vocab_size,
+        scale=scale,
+    )
+    assert isinstance(processor, SpyreLogitsProcessor)
+
+    torch.manual_seed(44)
+    hidden = torch.randn(num_tokens, embedding_dim, dtype=torch.float16) * 0.01
+    hidden_spyre = hidden.to(spyre_or_cpu_device)
+
+    # Reference: upstream logic on CPU.
+    logits_ref = F.linear(hidden, weight)
+    logits_ref = logits_ref[..., :vocab_size]
+    logits_ref = logits_ref * scale
+
+    # Spyre path.
+    logits_out = processor(fake_head, hidden_spyre, embedding_bias=None)
+    assert logits_out is not None
+
+    torch.testing.assert_close(logits_out.cpu().float(), logits_ref.float(), atol=1e-2, rtol=1e-2)
+
+
+@pytest.fixture
+def spyre_or_cpu_device():
+    """Use Spyre if available, otherwise CPU."""
+    try:
+        torch.randn(1, device=torch.device("spyre"))
+        return torch.device("spyre")
+    except Exception:
+        return torch.device("cpu")
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

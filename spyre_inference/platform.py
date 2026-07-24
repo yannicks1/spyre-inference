@@ -49,6 +49,22 @@ else:
 logger = init_logger(__name__)
 
 
+def _disable_torch_accelerator() -> None:
+    # Spyre has no torch.accelerator device, so empty_cache()/synchronize()
+    # raise "Cannot access accelerator device when none is available." Our OOT
+    # platform (not CPU) makes vLLM's cleanup_dist_env_and_memory() skip its
+    # is_cpu() guard and call empty_cache() at EngineCore shutdown. Patch at
+    # import to cover every process; matches vLLM's CPU worker (issue #327).
+    def _noop(*args, **kwargs) -> None:
+        return None
+
+    torch.accelerator.empty_cache = _noop  # ty: ignore[invalid-assignment]
+    torch.accelerator.synchronize = _noop  # ty: ignore[invalid-assignment]
+
+
+_disable_torch_accelerator()
+
+
 class TorchSpyrePlatform(CpuPlatform):
     _enum = PlatformEnum.OOT
 
@@ -192,6 +208,25 @@ class TorchSpyrePlatform(CpuPlatform):
 
     @classmethod
     def get_attn_backend_cls(cls, selected_backend, *args, **kwargs) -> str:
+        # Encoder (pooling) layers have no KV cache and run bidirectional SDPA;
+        # decoders use the paged backend. vLLM passes attn_type via the selector
+        # config, so the choice lives here rather than as a branch in the impl.
+        from vllm.v1.attention.backend import AttentionType
+
+        attn_selector_config = kwargs.get("attn_selector_config") or (args[0] if args else None)
+        attn_type = getattr(attn_selector_config, "attn_type", None)
+        if attn_type in (AttentionType.ENCODER, AttentionType.ENCODER_ONLY):
+            # Specific Spyre attention for encoder models.
+            backend_path = (
+                "spyre_inference.v1.attention.backends.spyre_encoder_attn."
+                "SpyreEncoderAttentionBackend"
+            )
+        else:
+            # Standard Spyre attention.
+            backend_path = cls._backend_path
+
+        # Register the selected Spyre attention implementation as CUSTOM.
+        register_backend(AttentionBackendEnum.CUSTOM, backend_path)
         return AttentionBackendEnum.CUSTOM.get_path()
 
     @classmethod
@@ -260,19 +295,39 @@ class TorchSpyrePlatform(CpuPlatform):
         # call CpuPlatform.check_and_update_config()
         super().check_and_update_config(vllm_config)
 
-        # Pin the on-device KV cache to exactly what's needed to fill the
-        # configured batch area: max_num_seqs sequences × ceil(max_model_len /
-        # block_size) blocks each. Anything more is over-allocation while
-        # the attention op is still unoptimized.
+        # Pin the on-device KV cache to what's needed to fill the batch area:
+        # max_num_seqs × ceil(max_model_len / block_size) blocks. This
+        # single-group formula only holds for homogeneous models; hybrid models
+        # build several KV cache groups whose block count depends on vLLM's
+        # internal layer-grouping (not knowable here), so we skip the cap and
+        # let vLLM size the cache from the profiled memory budget instead.
         cache_config = vllm_config.cache_config
         if cache_config.num_gpu_blocks_override is None:
-            max_num_seqs = vllm_config.scheduler_config.max_num_seqs
-            max_model_len = vllm_config.model_config.max_model_len
-            blocks_per_seq = math.ceil(max_model_len / cache_config.block_size)
-            cache_config.num_gpu_blocks_override = max_num_seqs * blocks_per_seq
-            logger.info(
-                "Setting num_gpu_blocks_override=%d (%d seqs × %d blocks/seq)",
-                cache_config.num_gpu_blocks_override,
-                max_num_seqs,
-                blocks_per_seq,
-            )
+            if cls._is_hybrid_attention(vllm_config):
+                logger.info(
+                    "Hybrid attention model detected; leaving num_gpu_blocks "
+                    "to vLLM (skipping the single-group block-count override)."
+                )
+            else:
+                max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+                max_model_len = vllm_config.model_config.max_model_len
+                blocks_per_seq = math.ceil(max_model_len / cache_config.block_size)
+                cache_config.num_gpu_blocks_override = max_num_seqs * blocks_per_seq
+                logger.info(
+                    "Setting num_gpu_blocks_override=%d (%d seqs × %d blocks/seq)",
+                    cache_config.num_gpu_blocks_override,
+                    max_num_seqs,
+                    blocks_per_seq,
+                )
+
+    @staticmethod
+    def _is_hybrid_attention(vllm_config: VllmConfig) -> bool:
+        """Whether the model interleaves multiple attention types.
+
+        More than one distinct HF `layer_types` value means vLLM builds
+        multiple KV cache groups (a hybrid model).
+        """
+        model_config = vllm_config.model_config
+        hf_config = getattr(model_config, "hf_text_config", model_config.hf_config)
+        layer_types = getattr(hf_config, "layer_types", None)
+        return bool(layer_types) and len(set(layer_types)) > 1

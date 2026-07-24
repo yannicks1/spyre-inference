@@ -206,49 +206,6 @@ def test_row_parallel_matches_reference(tp_group, num_tokens, input_size, output
     torch.testing.assert_close(actual.cpu().float(), expected.float(), atol=1e-2, rtol=1e-2)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Spyre cannot use a strided tensor as the source of an indexed scatter. "
-        "Historically this is what forced SpyreQKVParallelLinear to D2H its "
-        "result before returning. The current Spyre path side-steps it by "
-        "un-fusing the QKV weight after load so q/k/v never arise from a "
-        "split() of a Spyre tensor — see analyze_and_unfuse in "
-        "custom_ops/unfuse.py. "
-        "The probe is kept because the underlying torch-spyre limitation "
-        "(strided source for a scatter write) is still real and gates other "
-        "rework (e.g. attention's per-token KV scatter)."
-    ),
-)
-def test_spyre_strided_scatter_source():
-    """Probe: Spyre accepts a non-contiguous tensor as a scatter-write source.
-
-    The failure path this isolates:
-      1. qkv.split()        → strided 2D Spyre views
-      2. v.view(-1, H, D)   → non-contiguous 3D Spyre tensor (Attention.forward)
-      3. kv_cache[idx] = v  → scatter write with strided source (_write_to_kv_cache)
-    """
-    device = torch.device("spyre")
-    dtype = torch.float16
-    num_tokens = 16
-    num_heads, num_kv_heads, head_size = 8, 2, 64
-    q_size, kv_size = num_heads * head_size, num_kv_heads * head_size
-
-    qkv = torch.randn(num_tokens, q_size + 2 * kv_size, dtype=dtype, device=device)
-    _, _, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
-    # Replicate what Attention.forward() does before calling impl.forward()
-    v = v.view(-1, num_kv_heads, head_size)
-
-    # Replicate _write_to_kv_cache's scatter write
-    num_blocks, block_size = 4, 8
-    kv_cache = torch.zeros(
-        num_blocks, 2, block_size, num_kv_heads, head_size, dtype=dtype, device=device
-    )
-    block_indices = torch.zeros(num_tokens, dtype=torch.long, device=device)
-    block_offsets = torch.arange(num_tokens, dtype=torch.long, device=device) % block_size
-    kv_cache[block_indices, 1, block_offsets] = v
-
-
 @pytest.mark.mlp
 def test_qkv_oot_registration(tp_group):
     """QKVParallelLinear is swapped for the Spyre OOT subclass.

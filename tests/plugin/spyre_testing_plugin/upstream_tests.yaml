@@ -107,6 +107,19 @@ tests:
               dtype: [torch.float16]
               max_tokens: [2] # one prefill and one decode
 
+    # gemma-3-1b-it is hybrid; test_dummy_loader exercises engine startup + KV
+    # cache init (the hybrid block-override path) with dummy weights, isolating
+    # it from gemma-3 generation quality. Injected via override (not in MODELS).
+    - rel_path: tests/models/language/generation/test_gemma.py
+      allow_list:
+        - test: "test_dummy_loader"
+          mode: mandatory_pass
+          tags: [gemma, upstream, uses_subprocess]
+          params:
+            override:
+              model:
+                - google/gemma-3-1b-it
+
     - rel_path: tests/models/language/generation_ppl_test/test_qwen.py
       allow_list:
         - test: "test_ppl"
@@ -116,16 +129,18 @@ tests:
     - rel_path: tests/models/language/pooling/test_embedding.py
       allow_list:
         - test: "test_models"
-          mode: skip # RuntimeError: Spyre backend does not support type conversion yet during copy
+          mode: mandatory_pass
           tags: [model, embedding, upstream, uses_subprocess]
           params:
             allow:
               model:
                 - BAAI/bge-base-en-v1.5
+                - sentence-transformers/all-MiniLM-L12-v2
 
     - rel_path: tests/models/language/pooling/test_auto_prefix_cache_support.py
       allow_list:
         - test: "test_embed_models"
+          # Prefix-cache path for embeds not validated on Spyre yet.
           mode: skip # RuntimeError: Spyre backend does not support type conversion yet during copy
           tags: [model, embedding, upstream, uses_subprocess]
           params:
