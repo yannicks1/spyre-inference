@@ -270,12 +270,15 @@ class _SpyreRotaryMixin:
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         # torch-spyre crashes compiling an on-device index_select whose index has
         # length 1 (the decode phase): the gather output at leading dim 1 aborts the
-        # scheduler regardless of how it is consumed. Pad the single token to 2, run
-        # the gather+rotation, and narrow back to 1 outside the compiled sub-forward.
+        # scheduler. Pad the single token to 2 by duplicating the whole row, run the
+        # gather+rotation, and slice back to 1. The pad must duplicate the full tensor
+        # (``cat([x, x])``) rather than append a size-1 slice (``x[-1:]``): a size-1
+        # slice on-device is itself an unsupported "stick expression 1". The trailing
+        # ``[:1]`` slice of a length-2 result is fine (verified on torch-spyre 7073e9c).
         if positions.shape[0] == 1:
-            positions = torch.cat([positions, positions[-1:]], dim=0)
-            query = torch.cat([query, query[-1:]], dim=0)
-            key = torch.cat([key, key[-1:]], dim=0) if key is not None else None
+            positions = torch.cat([positions, positions], dim=0)
+            query = torch.cat([query, query], dim=0)
+            key = torch.cat([key, key], dim=0) if key is not None else None
             out_query, out_key = self._forward(positions, query, key)
             return out_query[:1], (out_key[:1] if out_key is not None else None)
         return self._forward(positions, query, key)
