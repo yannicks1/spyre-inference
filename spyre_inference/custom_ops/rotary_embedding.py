@@ -53,6 +53,29 @@ logger = init_logger(__name__)
 _SPYRE_STICK = 64
 
 
+def _to_gather_layout(cache_flat: torch.Tensor, target_device: torch.device) -> torch.Tensor:
+    """Move a flat ``[max_pos, W]`` cache (``W`` a stick multiple) to ``target_device``
+    for on-device ``index_select``.
+
+    On Spyre the tensor must use the explicit outer-dim-untiled / stick-innermost
+    ``SpyreTensorLayout`` (``device_size=[max_pos, W//64, 64]``, ``stride_map=[W, 64, 1]``);
+    the default device layout tiles the rows so a gather along dim 0 reads scrambled
+    memory for any row wider than one stick. Non-Spyre devices (CPU math tests) keep the
+    plain layout — eager ``index_select`` works there.
+    """
+    if torch.device(target_device).type != "spyre":
+        return cache_flat.to(device=target_device)
+    from torch.spyre import DataFormats, SpyreTensorLayout
+
+    max_pos, width = cache_flat.shape
+    stl = SpyreTensorLayout(
+        device_size=[max_pos, width // _SPYRE_STICK, _SPYRE_STICK],
+        stride_map=[width, _SPYRE_STICK, 1],
+        device_dtype=DataFormats.SEN169_FP16,
+    )
+    return cache_flat.to("spyre", device_layout=stl)
+
+
 @lru_cache
 def _get_expand_matrix(
     inner: int, padded: int, device: torch.device, dtype: torch.dtype
@@ -68,22 +91,43 @@ def _get_expand_matrix(
     return convert(e, device=device, dtype=dtype)
 
 
+@lru_cache
+def _get_compress_matrix(
+    inner: int, padded: int, device: torch.device, dtype: torch.dtype
+) -> torch.Tensor:
+    """Constant ``{0, 1}`` matrix ``C`` [2*padded, 2*inner] that extracts the meaningful
+    ``inner`` elements of each padded neox half on-device via ``out @ C``.
+
+    The inverse of ``_get_expand_matrix``: the pad path zero-pads to the stick-aligned
+    ``padded`` before the rotation, then must drop the padding afterwards. A sub-stick
+    ``out[..., :inner]`` slice makes the compiler emit a non-stick-aligned kernel (the
+    scheduler aborts with "parameter value is multiple of stick size"), so the trim is
+    done as a stick-aligned matmul instead. Cached per ``(inner, padded, device, dtype)``.
+    """
+    c = torch.zeros(2 * padded, 2 * inner, dtype=dtype)
+    idx = torch.arange(inner)
+    c[idx, idx] = 1
+    c[padded + idx, inner + idx] = 1
+    return convert(c, device=device, dtype=dtype)
+
+
 def _rotate_neox_2x2(
     x: torch.Tensor,
     rot: torch.Tensor,
     head_size: int,
     expand_matrix: torch.Tensor | None,
+    compress_matrix: torch.Tensor | None,
 ) -> torch.Tensor:
     """Apply full neox RoPE via per-token 2x2 rotation matrices.
 
     ``x`` is [T, H*head_size] or [T, H, head_size]; ``rot`` is [T, 2, 2, padded]
     with ``padded >= head_size // 2``. When the inner dim head_size//2 is stick-aligned
-    ``expand_matrix`` is ``None`` and the split-half pairing is a pure view; otherwise
-    ``expand_matrix`` is the Spyre-resident ``{0, 1}`` matrix that zero-pads each half up
-    to ``padded`` via ``x @ E`` so the pairing-axis stride is aligned. It is precomputed
-    on-device off the compiled path (see ``_SpyreRotaryMixin.prime_device_cache``) so no
-    CPU constant is built inside the graph and lifted as a graph input.
-    Returns the rotated tensor with ``x``'s shape.
+    ``expand_matrix``/``compress_matrix`` are ``None`` and the split-half pairing is a pure
+    view; otherwise ``expand_matrix`` is the Spyre-resident ``{0, 1}`` matrix that zero-pads
+    each half up to ``padded`` via ``x @ E`` (aligning the pairing-axis stride), and
+    ``compress_matrix`` drops the padding again via ``out @ C`` (a stick-aligned matmul
+    instead of a sub-stick slice). Both are precomputed on-device off the compiled path
+    (see ``_SpyreRotaryMixin.prime_device_cache``). Returns the rotated tensor with ``x``'s shape.
     """
     num_tokens = x.shape[0]
     inner = head_size // 2
@@ -95,9 +139,9 @@ def _rotate_neox_2x2(
     else:
         x_pairs = x.view(num_tokens, -1, 2, inner)
     out = (rot.unsqueeze(1) * x_pairs.unsqueeze(-3)).sum(dim=-2)
-    if expand_matrix is not None:
-        out = out[..., :inner].contiguous()  # non-contiguous slice; copy before reshape
-    return out.flatten(-2).view(x.shape)
+    if compress_matrix is not None:
+        out = out.reshape(num_tokens, -1, 2 * padded) @ compress_matrix
+    return out.reshape(x.shape)
 
 
 class _SpyreRotaryMixin:
@@ -128,6 +172,7 @@ class _SpyreRotaryMixin:
         # Spyre-resident copies, primed off the compiled path in prime_device_cache.
         self._rotation_cache_dev: torch.Tensor | None = None
         self._expand_matrix: torch.Tensor | None = None
+        self._compress_matrix: torch.Tensor | None = None
         # index_select is only available under torch.compile; compile the sub-forward
         # so it works even in enforce_eager and standalone (mirrors SpyreSiluAndMul).
         # Under fullgraph model compile the _forward runs inside that graph anyway.
@@ -156,15 +201,36 @@ class _SpyreRotaryMixin:
         return self._rotation_cache
 
     def prime_device_cache(self, target_device: torch.device) -> None:
-        """Move the 2x2 rotation cache (and the expand matrix, if needed) to
+        """Move the flat 2x2 rotation cache (and the expand matrix, if needed) to
         ``target_device`` once, off the compiled path. ``_forward_native`` then gathers
-        this pass's per-token slice on-device with ``index_select``."""
-        if self._rotation_cache_dev is None:
-            self._rotation_cache_dev = convert(
-                self._get_rotation_cache(), device=target_device, dtype=self.dtype
-            )
-        if self._needs_expand and self._expand_matrix is None:
+        this pass's per-token slice on-device with ``index_select`` and reshapes it back
+        to ``[T, 2, 2, padded]``.
+
+        The cache is stored flat ``[max_pos, 4*padded]`` and moved with the explicit
+        outer-dim-untiled / stick-innermost Spyre layout (see ``_to_gather_layout``): the
+        default device tiling makes a dim-0 gather read scrambled memory for rows wider
+        than one stick.
+
+        Re-primes if the cache currently lives on a different device: ``get_rope`` caches
+        instances in ``_ROPE_DICT``, so a single instance may be primed for CPU (math
+        tests) and later reused on Spyre (device tests). Gathering with positions on a
+        different device than the cache raises a device-mismatch inside the compiled graph.
+        """
+        target_type = torch.device(target_device).type
+        if (
+            self._rotation_cache_dev is None
+            or self._rotation_cache_dev.device.type != target_type
+        ):
+            cache = self._get_rotation_cache()  # [max_pos, 2, 2, padded]
+            flat = cache.reshape(cache.shape[0], -1).contiguous()
+            self._rotation_cache_dev = _to_gather_layout(flat, target_device)
+        if self._needs_expand and (
+            self._expand_matrix is None or self._expand_matrix.device.type != target_type
+        ):
             self._expand_matrix = _get_expand_matrix(
+                self.rotary_dim // 2, self._padded_inner, target_device, self.dtype
+            )
+            self._compress_matrix = _get_compress_matrix(
                 self.rotary_dim // 2, self._padded_inner, target_device, self.dtype
             )
 
@@ -178,12 +244,19 @@ class _SpyreRotaryMixin:
 
         ``positions`` is 1-D Spyre int; the ``index_select`` gather runs on-device (indirect
         access is supported under torch.compile). ``query``/``key`` arrive on Spyre from the
-        QKV projection; the cache and expand matrix are primed on Spyre off the compiled path.
+        QKV projection; the flat cache and expand matrix are primed on Spyre off the compiled
+        path. The gathered flat ``[T, 4*padded]`` slice is reshaped back to ``[T, 2, 2, padded]``.
         """
-        rot = torch.index_select(self._rotation_cache_dev, 0, positions)
-        out_query = _rotate_neox_2x2(query, rot, self.head_size, self._expand_matrix)
+        rot = torch.index_select(self._rotation_cache_dev, 0, positions).view(
+            positions.shape[0], 2, 2, self._padded_inner
+        )
+        out_query = _rotate_neox_2x2(
+            query, rot, self.head_size, self._expand_matrix, self._compress_matrix
+        )
         out_key = (
-            _rotate_neox_2x2(key, rot, self.head_size, self._expand_matrix)
+            _rotate_neox_2x2(
+                key, rot, self.head_size, self._expand_matrix, self._compress_matrix
+            )
             if key is not None
             else None
         )
@@ -195,6 +268,16 @@ class _SpyreRotaryMixin:
         query: torch.Tensor,
         key: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        # torch-spyre crashes compiling an on-device index_select whose index has
+        # length 1 (the decode phase): the gather output at leading dim 1 aborts the
+        # scheduler regardless of how it is consumed. Pad the single token to 2, run
+        # the gather+rotation, and narrow back to 1 outside the compiled sub-forward.
+        if positions.shape[0] == 1:
+            positions = torch.cat([positions, positions[-1:]], dim=0)
+            query = torch.cat([query, query[-1:]], dim=0)
+            key = torch.cat([key, key[-1:]], dim=0) if key is not None else None
+            out_query, out_key = self._forward(positions, query, key)
+            return out_query[:1], (out_key[:1] if out_key is not None else None)
         return self._forward(positions, query, key)
 
 

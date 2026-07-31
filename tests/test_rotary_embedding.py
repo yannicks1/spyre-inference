@@ -242,9 +242,9 @@ def test_rotary_cache_isolated_across_layers(default_vllm_config, head_size):
 @pytest.mark.rotary
 @pytest.mark.parametrize("head_size", HEAD_SIZES)
 def test_prime_device_cache_moves_cache_to_spyre(default_vllm_config, head_size):
-    """prime_device_cache moves the 2x2 rotation cache
-    [max_pos, 2, 2, round_up(rotary_dim//2)] onto Spyre; the expand matrix is primed only
-    when the inner dim is not stick-aligned."""
+    """prime_device_cache moves the flat 2x2 rotation cache
+    [max_pos, 4*round_up(rotary_dim//2)] onto Spyre; the expand/compress matrices are
+    primed only when the inner dim is not stick-aligned."""
     from vllm.model_executor.layers.rotary_embedding import get_rope
     from vllm.utils.math_utils import round_up
     from spyre_inference.custom_ops.rotary_embedding import _SPYRE_STICK
@@ -256,12 +256,16 @@ def test_prime_device_cache_moves_cache_to_spyre(default_vllm_config, head_size)
     padded = round_up(rope.rotary_dim // 2, _SPYRE_STICK)
     assert rope._rotation_cache_dev is not None
     assert rope._rotation_cache_dev.device.type == "spyre"
-    assert tuple(rope._rotation_cache_dev.shape) == (max_position, 2, 2, padded)
-    # Expand matrix only exists when padding was needed (head_size=64 -> inner 32 -> padded 64).
+    # Stored flat [max_pos, 2*2*padded] so the on-device gather reads stick-aligned rows.
+    assert tuple(rope._rotation_cache_dev.shape) == (max_position, 4 * padded)
+    # Expand/compress matrices only exist when padding was needed
+    # (head_size=64 -> inner 32 -> padded 64).
     if rope._needs_expand:
         assert rope._expand_matrix is not None and rope._expand_matrix.device.type == "spyre"
+        assert rope._compress_matrix is not None and rope._compress_matrix.device.type == "spyre"
     else:
         assert rope._expand_matrix is None
+        assert rope._compress_matrix is None
 
 
 @pytest.mark.rotary
