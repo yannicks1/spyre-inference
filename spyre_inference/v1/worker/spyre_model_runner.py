@@ -814,14 +814,11 @@ class TorchSpyreModelRunner(GPUModelRunner):
     def initialize_kv_cache_tensors(self, kv_cache_config, kernel_block_sizes):
         """Allocate KV cache as dense paged tensors on Spyre.
 
-        Each layer maps to a SpyrePagedKVCache(k_pages, v_pages) whose tensors
-        are shaped [num_blocks, block_size, num_kv_heads, head_size], matching
-        SpyreAttentionBackend.get_kv_cache_shape. The attention kernel selects a
-        page by indexing with a one-element device tensor, so the page read is a
-        real indirect access. For hybrid models (Gemma-4) that pool multiple
-        layers into one KVCacheTensor, layers of the same page shape share one
-        physical page-set, so the footprint scales with the number of distinct
-        page shapes rather than the pooled layer count — see the loop below.
+        Each layer maps to a SpyrePagedKVCache(k_pages, v_pages) shaped
+        [num_blocks, block_size, num_kv_heads, head_size], matching
+        SpyreAttentionBackend.get_kv_cache_shape. The kernel selects a page by
+        indexing with a one-element device tensor (a real indirect access, not
+        a view). Same-shape layers pooled into one tensor share a page-set.
         """
         from vllm.v1.worker.utils import bind_kv_cache
         from spyre_inference.v1.attention.backends.spyre_attn import (
@@ -839,9 +836,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # SpyrePagedKVCache — see the suppression on `bind_kv_cache(...)` below.
         kv_caches: dict[str, SpyrePagedKVCache] = {}
 
-        # Accounting for the hybrid footprint: number of physical page-sets actually
-        # allocated vs. the pooled layer count. With shape-sharing these differ only
-        # for hybrid models; logging it makes the memory saving visible.
         num_page_sets = 0
         num_pooled_layers = 0
 
@@ -851,17 +845,12 @@ class TorchSpyreModelRunner(GPUModelRunner):
             ref_spec = spec_by_layer[kv_cache_tensor.shared_by[0]]
             num_blocks = kv_cache_tensor.size // ref_spec.page_size_bytes
 
-            # Hybrid models (e.g. Gemma-4 dense) pool layers of DIFFERENT shapes into one
-            # tensor, expecting each to take a differently-shaped view of the shared bytes
-            # (as the GPU runner does by aliasing). Spyre's stickified layout is
-            # shape-specific and can't be re-viewed per shape ("Unexpected stick
-            # expression"), so we can't alias across distinct shapes. But layers of the
-            # SAME shape that share this tensor come from different KV-cache groups (vLLM
-            # takes at most one layer per group per tensor) and therefore always draw
-            # DISJOINT block ids from vLLM's single global block pool — so they can safely
-            # share one physical page-list. Allocate one page-set per distinct shape and
-            # let same-shape layers reference it. Footprint scales with the number of
-            # distinct page shapes (2 for Gemma-4: sliding + full), not len(shared_by).
+            # Hybrid models (Gemma-4) pool DIFFERENT-shaped layers into one tensor,
+            # expecting each to alias the shared bytes at its own shape. Spyre's
+            # stickified layout can't be re-viewed per shape ("Unexpected stick
+            # expression"), so allocate one page-set per distinct shape. Same-shape
+            # layers here come from different KV-cache groups, so they draw disjoint
+            # block ids from the single global pool and can safely share one page-set.
             pages_by_shape: dict[tuple[int, int, int], SpyrePagedKVCache] = {}
             for layer_name in kv_cache_tensor.shared_by:
                 spec = spec_by_layer[layer_name]
@@ -895,9 +884,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 kv_caches[layer_name] = cache
             num_pooled_layers += len(kv_cache_tensor.shared_by)
 
-        # For homogeneous models these are equal; for hybrid models (distinct page
-        # shapes pooled per tensor) the footprint scales with distinct shapes, not
-        # layers — e.g. Gemma-4: 20 page-sets for 60 pooled layers instead of 60.
         logger.info(
             "Allocated %d KV page-sets for %d pooled layers across %d tensors "
             "(footprint scales with distinct page shapes, not layer count).",

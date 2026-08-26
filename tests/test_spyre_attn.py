@@ -1093,14 +1093,9 @@ def test_kv_cache_shape_matches_runner_allocation():
 
 
 def test_hybrid_kv_cache_shares_pages_within_shape():
-    """Hybrid models pool differently-shaped layers into one KVCacheTensor.
-
-    Spyre can't alias one stickified buffer as two page shapes, but same-shape
-    layers sharing a tensor come from different KV-cache groups (disjoint block
-    ids), so they can safely share one physical page-list. The runner must
-    therefore allocate one page-set per DISTINCT shape and let same-shape layers
-    reference it — footprint scaling with distinct shapes (2 for Gemma-4), not
-    len(shared_by). This regression-guards issue #639.
+    """Same-shape layers pooled into one KVCacheTensor share a single page-set;
+    a distinct shape gets its own. Footprint scales with distinct shapes, not
+    len(shared_by). Regression guard for #639.
     """
     from vllm.config import VllmConfig, ModelConfig, CacheConfig
     from vllm.config.compilation import CompilationConfig
@@ -1158,8 +1153,7 @@ def test_hybrid_kv_cache_shares_pages_within_shape():
 
     caches = runner.initialize_kv_cache_tensors(kv_cache_config, [block_size])
 
-    # Same-shape layers share ONE page-set (object identity); the distinct shape
-    # gets its own. Distinct physical page-sets == distinct shapes (2), not 4.
+    # Distinct physical page-sets == distinct shapes (2), not the layer count (4).
     assert caches["model.layers.0.self_attn"].k_pages is caches["model.layers.1.self_attn"].k_pages
     assert caches["model.layers.0.self_attn"].k_pages is caches["model.layers.2.self_attn"].k_pages
     assert caches["model.layers.0.self_attn"].v_pages is caches["model.layers.2.self_attn"].v_pages
