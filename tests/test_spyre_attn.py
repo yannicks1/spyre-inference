@@ -1092,6 +1092,88 @@ def test_kv_cache_shape_matches_runner_allocation():
     assert k_pages.shape == (num_blocks, block_size, num_kv_heads, head_size)
 
 
+def test_hybrid_kv_cache_shares_pages_within_shape():
+    """Hybrid models pool differently-shaped layers into one KVCacheTensor.
+
+    Spyre can't alias one stickified buffer as two page shapes, but same-shape
+    layers sharing a tensor come from different KV-cache groups (disjoint block
+    ids), so they can safely share one physical page-list. The runner must
+    therefore allocate one page-set per DISTINCT shape and let same-shape layers
+    reference it — footprint scaling with distinct shapes (2 for Gemma-4), not
+    len(shared_by). This regression-guards issue #639.
+    """
+    from vllm.config import VllmConfig, ModelConfig, CacheConfig
+    from vllm.config.compilation import CompilationConfig
+    from vllm.v1.kv_cache_interface import (
+        AttentionSpec,
+        KVCacheConfig,
+        KVCacheGroupSpec,
+        KVCacheTensor,
+    )
+    from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
+
+    block_size = 128
+    num_blocks = 16
+    # Two distinct page shapes with EQUAL page_size_bytes (8*128 == 4*256), which
+    # is exactly why vLLM pools them into one tensor (as it does for Gemma-4).
+    spec_a = AttentionSpec(
+        block_size=block_size, num_kv_heads=8, head_size=128, dtype=torch.float16
+    )
+    spec_b = AttentionSpec(
+        block_size=block_size, num_kv_heads=4, head_size=256, dtype=torch.float16
+    )
+    assert spec_a.page_size_bytes == spec_b.page_size_bytes
+
+    model_config = ModelConfig(
+        model="Qwen/Qwen3-0.6B", max_model_len=1, dtype=torch.float16, trust_remote_code=True
+    )
+    vllm_config = VllmConfig(
+        model_config=model_config,
+        cache_config=CacheConfig(block_size=block_size),
+        compilation_config=CompilationConfig(custom_ops=["all"]),
+    )
+    runner = TorchSpyreModelRunner(vllm_config, torch.device("cpu"))
+
+    # 3 shape-A layers + 1 shape-B layer, all pooled into one tensor — mirrors a
+    # Gemma-4 tensor (5 sliding + 1 full) with the layer count scaled down.
+    # vLLM's bind_kv_cache extracts each layer's index from its name, so the
+    # names need exactly one bare-integer path segment and distinct indices.
+    a_layers = ["model.layers.0.self_attn", "model.layers.1.self_attn", "model.layers.2.self_attn"]
+    b_layers = ["model.layers.3.self_attn"]
+    shared_by = a_layers + b_layers
+    kv_cache_config = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[
+            KVCacheTensor(size=spec_a.page_size_bytes * num_blocks, shared_by=shared_by)
+        ],
+        kv_cache_groups=[
+            KVCacheGroupSpec(layer_names=a_layers, kv_cache_spec=spec_a),
+            KVCacheGroupSpec(layer_names=b_layers, kv_cache_spec=spec_b),
+        ],
+    )
+    for ln in shared_by:
+        fake_layer = Mock()
+        fake_layer.kv_cache = None
+        runner.compilation_config.static_forward_context[ln] = fake_layer
+
+    caches = runner.initialize_kv_cache_tensors(kv_cache_config, [block_size])
+
+    # Same-shape layers share ONE page-set (object identity); the distinct shape
+    # gets its own. Distinct physical page-sets == distinct shapes (2), not 4.
+    assert caches["model.layers.0.self_attn"].k_pages is caches["model.layers.1.self_attn"].k_pages
+    assert caches["model.layers.0.self_attn"].k_pages is caches["model.layers.2.self_attn"].k_pages
+    assert caches["model.layers.0.self_attn"].v_pages is caches["model.layers.2.self_attn"].v_pages
+    assert (
+        caches["model.layers.3.self_attn"].k_pages is not caches["model.layers.0.self_attn"].k_pages
+    )
+    distinct = {id(c.k_pages) for c in caches.values()}
+    assert len(distinct) == 2, f"expected 2 physical page-sets, got {len(distinct)}"
+
+    # Each layer still views its own native shape.
+    assert caches["model.layers.0.self_attn"].k_pages.shape == (num_blocks, block_size, 8, 128)
+    assert caches["model.layers.3.self_attn"].k_pages.shape == (num_blocks, block_size, 4, 256)
+
+
 def test_sliding_window_none_equivalence(default_vllm_config):
     """Verify sliding_window=None produces identical results to full attention.
 
