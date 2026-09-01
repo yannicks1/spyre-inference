@@ -822,8 +822,9 @@ def test_spyre_scalar_pow_cube(spyre_device):
 # Each probe guards one workaround in custom_ops/{gemma4_routing_patch,
 # gate_linear,fused_moe}.py: a primitive the MoE path needs that torch-spyre
 # cannot do yet. When one flips to XPASS, delete the matching workaround.
-# The routing patch runs eager per-op, so the routing probes are eager; the
-# expert compute is traced, so those compile.
+# Routing and expert compute run as their own compiled regions (vLLM's opaque
+# vllm.moe_forward leaves them eager otherwise), so probes for either compile;
+# only the pure dtype/device-capability probes stay eager.
 
 
 @pytest.mark.xfail(
@@ -832,10 +833,10 @@ def test_spyre_scalar_pow_cube(spyre_device):
         "topk on a single row [1, E] cannot be produced on device: the Inductor "
         "topk layout pass fails ('AllSameNode.from_args: out_layouts is empty', "
         "propagate_layouts._topk_layouts). A [2, E] input works. "
-        "gemma4_routing_patch expands a T==1 decode to two rows and slices back; "
-        "topk is the last blocker for that expand (single-row amax/sum reductions "
-        "already lower, emitting only a harmless RetileWarning), so drop the "
-        "expand when this passes."
+        "gemma4_routing_patch runs the whole routing chain on two rows and slices "
+        "back at the end; drop the expand when this passes. Slicing back earlier "
+        "is not an option either -- the mask and the renormalizing sum then see "
+        "operands on incompatible sticks."
     ),
 )
 def test_spyre_moe_single_row_topk(spyre_device):
@@ -889,10 +890,11 @@ def test_spyre_moe_fp16_to_fp32_restickify(spyre_device):
     strict=True,
     reason=(
         "Rebuilding a dense [T, E] combine from a [T, K] top-k selection needs a "
-        "scatter (or one_hot) Spyre cannot lower. gemma4_routing_patch returns the "
-        "dense [T, E] combine and forward_oot evaluates all experts to avoid it; "
-        "when scatter works, routing can return the customary [T, K] and "
-        "forward_oot can gather only the active experts."
+        "scatter (or one_hot) Spyre cannot lower -- gemma4_routing_patch masks "
+        "against a k-th-largest threshold instead, and returns that dense "
+        "[T, E, 1] combine so forward_oot can evaluate all experts. When scatter "
+        "works, routing can return the customary [T, K] and forward_oot can "
+        "gather only the active experts."
     ),
 )
 def test_spyre_moe_scatter_dense_from_topk(spyre_device):
@@ -909,6 +911,33 @@ def test_spyre_moe_scatter_dense_from_topk(spyre_device):
         -1, ids.cpu(), vals.cpu()
     )
     torch.testing.assert_close(dense.cpu(), expected, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "top-k over a prefill-width batch does not lower: the reduction axis ends "
+        "up inside the stick ('topkvalue stick must not contain the reduction or k "
+        "dimension'), where the same op on two rows compiles fine. So "
+        "gemma4_routing_patch only compiles its T==1 decode routing and lets "
+        "prefill route eagerly -- compile both when this passes."
+    ),
+)
+def test_spyre_moe_prefill_width_topk(spyre_device):
+    """Compiled top-k over a prefill-width batch (the T>1 routing case)."""
+    num_tokens, num_experts, topk = 16, 128, 8
+    probs = torch.softmax(
+        torch.randn(num_tokens, num_experts, dtype=torch.float16, device=spyre_device), dim=-1
+    )
+
+    @torch.compile(dynamic=False)
+    def fn(probs):
+        vals, _ = torch.topk(probs, topk, dim=-1)
+        return -(-vals).amax(dim=-1, keepdim=True)
+
+    out = fn(probs)
+    expected = torch.topk(probs.cpu(), topk, dim=-1).values.amin(dim=-1, keepdim=True)
+    torch.testing.assert_close(out.cpu(), expected, atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.xfail(
@@ -943,9 +972,9 @@ def test_spyre_moe_expanded_view_matmul(spyre_device):
     reason=(
         "The upper half-slice of a stacked weight, w13[:, I:, :], is a "
         "stick-unaligned partial-stick start that does not lower. "
-        "process_weights_after_loading splits w13 into contiguous w1/w3 halves on "
-        "CPU instead (the split also dodges the ~484 MiB per-core span of the full "
-        "transpose at E=128). Drop the split when the offset half-slice lowers."
+        "process_weights_after_loading splits w13 into contiguous halves on CPU "
+        "instead -- where it also transposes them, which is worth ~4x per layer on "
+        "its own. Drop the split when the offset half-slice lowers."
     ),
 )
 def test_spyre_moe_offset_half_slice_matmul(spyre_device):
