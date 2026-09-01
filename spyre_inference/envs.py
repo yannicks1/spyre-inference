@@ -47,7 +47,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     #  - "model": compile the whole model as a single graph
     "SPYRE_COMPILE_GRANULARITY": lambda: os.getenv("SPYRE_COMPILE_GRANULARITY") or "block",
     # When "1", wrap attention forward/softmax in torch.profiler.record_function
-    # spans for kineto trace capture. Off by default.
+    # spans for kineto trace capture. Off by default: profiled runs are not
+    # wall-clock comparable.
     "SPYRE_ATTN_PROFILING": lambda: bool(int(os.getenv("SPYRE_ATTN_PROFILING", "0"))),
     # When "1", enables the bucketed multi-sequence decode kernel. Off by default
     # pending performance characterisation at small batch sizes (num_seqs <= 4).
