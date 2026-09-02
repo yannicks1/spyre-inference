@@ -46,7 +46,16 @@ _COSINE_MIN = 0.99
             "google/gemma-4-31B",
             "\n\nWhat are the main businesses of IBM?\n\nWhat are the main businesses of",
         ),
+        # E-variant: per-layer embeddings + KV-sharing over the trailing 20 layers,
+        # neither of which the dense 12B/31B rows exercise.
+        (
+            "google/gemma-4-E2B",
+            "\n\nWhat is the main business of IBM?\n\nWhat is the main business of",
+        ),
     ],
+    # Named so a single model can be selected while iterating; the default tuple ids
+    # ("model_ref_output0", ...) make `-k` useless for a slow on-device matrix.
+    ids=["micro-g3.3-8b", "gemma-3-1b-it", "gemma-4-31B", "gemma-4-E2B"],
 )
 def test_basic_llm_inference(model_ref_output, monkeypatch: pytest.MonkeyPatch) -> None:
     """Construct `vllm.LLM(enforce_eager=False)` end-to-end.

@@ -509,22 +509,27 @@ class TorchSpyrePlatform(CpuPlatform):
         super().check_and_update_config(vllm_config)
 
         # Pin the on-device KV cache to what's needed to fill the batch area:
-        # max_num_seqs × ceil(max_model_len / block_size) blocks. This
-        # single-group formula only holds for homogeneous decoder models.
+        # max_num_seqs × ceil(max_model_len / block_size) blocks.
+        #
+        # This single-group formula holds for hybrid (interleaved sliding/full)
+        # decoders too, because `disable_hybrid_kv_cache_manager` above makes vLLM
+        # promote the sliding-window specs to full attention and collapse every layer
+        # into ONE `UniformTypeKVCacheSpecs` group, whose blocks come from the single
+        # global BlockPool. Hybrid models used to skip the cap, on the (then correct)
+        # grounds that multi-group block counts are not knowable here; the result was a
+        # cache sized purely from the profiled budget — 1820 blocks / 232,960 tokens for
+        # gemma-4-E2B at max_num_seqs=2, max_model_len=2048, i.e. 55x the 33 blocks the
+        # batch can use. That is not just wasted HBM: the attention kernel takes the
+        # slot-major KV view as its scatter-before-read argument, so the oversized
+        # buffer showed up as a 119 MB per-layer graph argument and dominated decode
+        # (E2B: 254 -> 73 ms/token once right-sized, output unchanged).
+        #
         # Pooling / encoder-only models have no KV cache — do not size one.
-        # Hybrid models build several KV cache groups whose block count depends
-        # on vLLM's internal layer-grouping (not knowable here), so we skip the
-        # cap and let vLLM size the cache from the profiled memory budget.
         cache_config = vllm_config.cache_config
         if cache_config.num_gpu_blocks_override is None:
             if cls._is_pooling_model(vllm_config):
                 logger.info(
                     "Pooling/encoder model has no KV cache; leaving num_gpu_blocks_override unset."
-                )
-            elif cls._is_hybrid_attention(vllm_config):
-                logger.info(
-                    "Hybrid attention model detected; leaving num_gpu_blocks "
-                    "to vLLM (skipping the single-group block-count override)."
                 )
             else:
                 max_num_seqs = vllm_config.scheduler_config.max_num_seqs
@@ -544,15 +549,3 @@ class TorchSpyrePlatform(CpuPlatform):
         """Encoder / embedding / scoring models (no paged KV cache)."""
         model_config = vllm_config.model_config
         return getattr(model_config, "runner_type", None) == "pooling"
-
-    @staticmethod
-    def _is_hybrid_attention(vllm_config: VllmConfig) -> bool:
-        """Whether the model interleaves multiple attention types.
-
-        More than one distinct HF `layer_types` value means vLLM builds
-        multiple KV cache groups (a hybrid model).
-        """
-        model_config = vllm_config.model_config
-        hf_config = getattr(model_config, "hf_text_config", model_config.hf_config)
-        layer_types = getattr(hf_config, "layer_types", None)
-        return bool(layer_types) and len(set(layer_types)) > 1

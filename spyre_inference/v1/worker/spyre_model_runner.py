@@ -996,6 +996,38 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
     # --- KV cache allocation ---
 
+    def maybe_add_kv_sharing_layers_to_kv_cache_groups(self, kv_cache_config) -> None:
+        """Also mirror each KV-sharing layer's spec into its group's per-layer specs.
+
+        Upstream appends a KV-sharing layer to its producer's group ``layer_names`` but
+        never to a ``UniformTypeKVCacheSpecs.kv_cache_specs`` dict, because on GPU the
+        hybrid KV-cache manager keeps one group per attention type, whose spec is a
+        plain ``KVCacheSpec`` looked up group-wide. We set
+        ``disable_hybrid_kv_cache_manager`` (see ``TorchSpyrePlatform``), which collapses
+        a hybrid model into a single ``UniformTypeKVCacheSpecs`` group that is indexed
+        *per layer* — so ``initialize_attn_backend`` would KeyError on the appended
+        names (Gemma-4 E2B/E4B: the trailing ``num_kv_shared_layers`` layers).
+
+        A sharing layer reuses its producer's cache, so it has the producer's page
+        shape by construction; copying that spec is exact, not an approximation. Only
+        the worker's deepcopy of the config is touched, and the sizes in
+        ``kv_cache_tensors`` were fixed before this runs, so the extra entries add no
+        allocation — ``initialize_kv_cache_tensors`` aliases sharing layers onto the
+        producer's pages.
+        """
+        super().maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
+
+        from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
+
+        for group in kv_cache_config.kv_cache_groups:
+            spec = group.kv_cache_spec
+            if not isinstance(spec, UniformTypeKVCacheSpecs):
+                continue
+            for layer_name in group.layer_names:
+                if layer_name not in spec.kv_cache_specs:
+                    target = self.shared_kv_cache_layers[layer_name]
+                    spec.kv_cache_specs[layer_name] = spec.kv_cache_specs[target]
+
     def initialize_kv_cache_tensors(self, kv_cache_config, kernel_block_sizes):
         """Allocate KV cache as one dense paged tensor per layer on Spyre.
 
