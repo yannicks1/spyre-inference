@@ -509,21 +509,9 @@ class TorchSpyrePlatform(CpuPlatform):
         super().check_and_update_config(vllm_config)
 
         # Pin the on-device KV cache to what's needed to fill the batch area:
-        # max_num_seqs × ceil(max_model_len / block_size) blocks.
-        #
-        # This single-group formula holds for hybrid (interleaved sliding/full)
-        # decoders too, because `disable_hybrid_kv_cache_manager` above makes vLLM
-        # promote the sliding-window specs to full attention and collapse every layer
-        # into ONE `UniformTypeKVCacheSpecs` group, whose blocks come from the single
-        # global BlockPool. Hybrid models used to skip the cap, on the (then correct)
-        # grounds that multi-group block counts are not knowable here; the result was a
-        # cache sized purely from the profiled budget — 1820 blocks / 232,960 tokens for
-        # gemma-4-E2B at max_num_seqs=2, max_model_len=2048, i.e. 55x the 33 blocks the
-        # batch can use. That is not just wasted HBM: the attention kernel takes the
-        # slot-major KV view as its scatter-before-read argument, so the oversized
-        # buffer showed up as a 119 MB per-layer graph argument and dominated decode
-        # (E2B: 254 -> 73 ms/token once right-sized, output unchanged).
-        #
+        # max_num_seqs × ceil(max_model_len / block_size) blocks. Holds for hybrid
+        # decoders too: `disable_hybrid_kv_cache_manager` above collapses every layer into
+        # one `UniformTypeKVCacheSpecs` group drawing from the single global BlockPool.
         # Pooling / encoder-only models have no KV cache — do not size one.
         cache_config = vllm_config.cache_config
         if cache_config.num_gpu_blocks_override is None:

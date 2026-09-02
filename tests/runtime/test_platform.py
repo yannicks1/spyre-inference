@@ -232,12 +232,8 @@ def test_num_gpu_blocks_override_homogeneous():
 def test_num_gpu_blocks_override_hybrid_matches_homogeneous():
     """Hybrid models get the same block count: one collapsed KV cache group.
 
-    `disable_hybrid_kv_cache_manager` promotes the sliding-window specs to full
-    attention and merges every layer into a single `UniformTypeKVCacheSpecs` group, so
-    the single-group formula applies unchanged. Leaving it unset instead sized the cache
-    from the profiled memory budget — 55x the batch's needs on gemma-4-E2B, which
-    dominated decode because the oversized slot-major KV view is an attention-kernel
-    argument.
+    ``disable_hybrid_kv_cache_manager`` merges every layer into a single
+    ``UniformTypeKVCacheSpecs`` group, so the single-group formula applies unchanged.
     """
     from spyre_inference.platform import TorchSpyrePlatform
 
