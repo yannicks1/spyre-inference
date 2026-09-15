@@ -48,8 +48,10 @@ from spyre_inference.v1.attention.ops.page_attn import page_attn_kernel
 from spyre_inference.v1.attention.ops.reshape_and_cache import reshape_and_cache_kernel
 from spyre_inference.v1.attention.spyre_attn_bucketer import (
     _MIN_BATCHED_SEQS,
+    SpyreAttnBatchedDecodeBucket,
     SpyreAttnBucket,
     SpyreAttnBucketer,
+    batched_decode_chunking,
 )
 
 logger = init_logger(__name__)
@@ -89,8 +91,6 @@ def _record_block(name: str):
     with torch.profiler.record_function(name):
         yield
 
-
-_SPYRE_CORE_COUNT = 32
 
 # mean/max decode block count: low means the batch pads short sequences up to a
 # much longer one. Calibrated from the crossover sweep; 0.0 disables.
@@ -800,14 +800,10 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 # bucket round-up (which padding the denser ladder addresses instead).
                 decode_uniformity = (sum(decode_blocks) / num_decode_seqs) / max(decode_blocks)
                 padded_num_seqs = b_seqs
-                # Entries target the cores: fewer under-fills them, more than one
-                # stick's worth hits a backend axis-merge limit.
-                blocks_per_chunk = max(1, min(_SPYRE_CORE_COUNT // b_seqs, b_blocks))
-                # blocks_per_chunk need not divide b_blocks, so pad the block axis
-                # up to a whole chunk. Padding columns gather page 0 under an
-                # all--inf mask and contribute zero; chunk 0 still holds every real
-                # row's block 0, so the running max stays finite.
-                num_chunks = (b_blocks + blocks_per_chunk - 1) // blocks_per_chunk
+                # Padding columns gather page 0 under an all--inf mask and
+                # contribute zero; chunk 0 still holds every real row's block 0,
+                # so the running max stays finite.
+                blocks_per_chunk, num_chunks = batched_decode_chunking(b_seqs, b_blocks)
                 padded_batch_blocks = num_chunks * blocks_per_chunk
                 assert padded_batch_blocks >= b_blocks
                 entries = b_seqs * blocks_per_chunk
@@ -932,6 +928,41 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 is_prefilling=torch.tensor([query_len > 1]),
             ),
         )
+
+    def build_for_batched_decode_variant(
+        self, bucket: SpyreAttnBatchedDecodeBucket
+    ) -> SpyreAttentionMetadata:
+        """Metadata for the all-decode batch that dispatches to ``bucket``.
+
+        ``num_seqs`` sequences of one query token each, all at the same length, so
+        ``find_sequence_bucket`` and ``find_blocks_bucket`` return the bucket's own
+        values and ``decode_uniformity`` is 1.
+        """
+        num_seqs = bucket.num_seqs
+        kv_len = bucket.num_blocks * self.block_size
+        query_start_loc = torch.arange(num_seqs + 1, dtype=torch.int32)
+        metadata = self.build(
+            common_prefix_len=0,
+            common_attn_metadata=CommonAttentionMetadata(
+                query_start_loc=query_start_loc,
+                query_start_loc_cpu=query_start_loc,
+                seq_lens=torch.full((num_seqs,), kv_len, dtype=torch.int32),
+                num_reqs=num_seqs,
+                num_actual_tokens=num_seqs,
+                max_query_len=1,
+                max_seq_len=kv_len,
+                # Every block points at page 0, vLLM's null block: nothing real is read.
+                block_table_tensor=torch.zeros(num_seqs, bucket.num_blocks, dtype=torch.int32),
+                slot_mapping=torch.zeros(num_seqs, dtype=torch.int64),
+                causal=True,
+                is_prefilling=torch.zeros(num_seqs, dtype=torch.bool),
+            ),
+        )
+        assert metadata.padded_num_seqs is not None, (
+            f"build() declined the batched path for {bucket}; the recorded variant would "
+            "not be the one dispatch reaches"
+        )
+        return metadata
 
 
 class SpyreAttentionBackend(AttentionBackend):
@@ -1111,7 +1142,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             "itself; a gather selecting its whole source faults the device"
         )
 
-    def _batched_decode_preconditions_met(self, attn_metadata: "SpyreAttentionMetadata") -> bool:
+    def _batched_decode_supported(self) -> bool:
+        """The batch-independent preconditions, so the warmup recorder can share them."""
         # Off by default: the batched matmul pads every sequence row up to the
         # bucket width, and that overhead is uncharacterised at the smallest
         # bucket (num_seqs == _MIN_BATCHED_SEQS), where there is no headroom.
@@ -1122,13 +1154,16 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # to int64 and fails eager; eager takes the per-seq loop instead.
         if not self._compile_attn:
             return False
-        # Layer 0's builder gates on the decode count and the bucket lattice;
-        # we add ALiBi, which the batched kernel doesn't implement.
+        # The batched kernel doesn't implement ALiBi.
+        return self.alibi_slopes is None
+
+    def _batched_decode_preconditions_met(self, attn_metadata: "SpyreAttentionMetadata") -> bool:
+        if not self._batched_decode_supported():
+            return False
+        # Layer 0's builder gates on the decode count and the bucket lattice.
         if attn_metadata.padded_num_seqs is None:
             return False
-        if attn_metadata.decode_uniformity < _BATCHED_DECODE_MIN_UNIFORMITY:
-            return False
-        return self.alibi_slopes is None
+        return attn_metadata.decode_uniformity >= _BATCHED_DECODE_MIN_UNIFORMITY
 
     # `kv_cache` widens the base's `torch.Tensor` to `SpyrePagedKVCache`,
     # which `TorchSpyreModelRunner.initialize_kv_cache_tensors` allocates
@@ -1223,18 +1258,30 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         num_pages = kv_cache[0].shape[0]
         variants = builder.attn_bucketer.variants()
+        decode_variants = (
+            builder.attn_bucketer.batched_decode_variants()
+            if self._batched_decode_supported()
+            else []
+        )
         t_start = time.time()
 
         # Belt-and-suspenders: platform._raise_dynamo_recompile_limits already
         # raises this globally, but bump it here too in case that hasn't run.
         prev_limit = torch._dynamo.config.accumulated_recompile_limit
         torch._dynamo.config.accumulated_recompile_limit = max(  # ty: ignore[invalid-assignment]
-            prev_limit, 4 * len(variants) + 64
+            prev_limit, 4 * (len(variants) + len(decode_variants)) + 64
         )
 
-        logger.info("Recording %d attention variants for layer...", len(variants))
+        logger.info(
+            "Recording %d per-seq + %d batched-decode attention variants for layer...",
+            len(variants),
+            len(decode_variants),
+        )
         try:
             recorded = self._record_all(variants, layer, kv_cache, builder, num_pages)
+            recorded_decode = self._record_batched_all(
+                decode_variants, layer, kv_cache, builder, num_pages
+            )
         finally:
             torch._dynamo.config.accumulated_recompile_limit = prev_limit  # ty: ignore[invalid-assignment]
 
@@ -1247,12 +1294,14 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 len(variants),
             )
         logger.info(
-            "Recorded %d/%d attention variants in %.2fs.",
+            "Recorded %d/%d per-seq and %d/%d batched-decode attention variants in %.2fs.",
             recorded,
             len(variants),
+            recorded_decode,
+            len(decode_variants),
             time.time() - t_start,
         )
-        return recorded
+        return recorded + recorded_decode
 
     def _record_all(
         self,
@@ -1322,6 +1371,100 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         # The staging buffers take the same pre-staged path attn_layer takes, so no
         # extra copies get traced. key/value are unused: attn_layer does the KV write.
+        q_staging, out_staging = self._staging_buffers(kv_cache[0].device)
+        self.forward(layer, q_staging, q_staging, q_staging, kv_cache, attn_metadata, out_staging)
+        return realized
+
+    def _record_batched_all(
+        self,
+        variants: "list[SpyreAttnBatchedDecodeBucket]",
+        layer: AttentionLayer,
+        kv_cache: SpyrePagedKVCache,
+        builder: "SpyreAttentionMetadataBuilder",
+        num_pages: int,
+    ) -> int:
+        # Checked once, outside the try below: the store these recordings trace needs
+        # staging at least as wide as the widest bucket, and swallowing that would
+        # leave dispatch tracing the fallback scatter instead.
+        widest = max((v.num_seqs for v in variants), default=0)
+        assert self.staging_rows >= widest, (
+            f"staging buffers hold {self.staging_rows} rows, below the widest num_seqs "
+            f"bucket {widest}; the recorded variants would not be the ones dispatch reaches"
+        )
+
+        recorded: set[tuple[int, int, int]] = set()
+        for i, bucket in enumerate(variants, start=1):
+            t0 = time.time()
+            try:
+                realized = self._record_batched_one(
+                    bucket, layer, kv_cache, builder, recorded, num_pages
+                )
+            except Exception:
+                logger.warning(
+                    "Batched decode variant %s failed to record; it will compile on first "
+                    "use instead.",
+                    bucket,
+                    exc_info=True,
+                )
+                continue
+            if realized is None:
+                continue
+            recorded.add(realized)
+            logger.debug(
+                "  [%d/%d] recorded %s in %.2fs",
+                i,
+                len(variants),
+                realized,
+                time.time() - t0,
+            )
+        return len(recorded)
+
+    def _record_batched_one(
+        self,
+        bucket: "SpyreAttnBatchedDecodeBucket",
+        layer: AttentionLayer,
+        kv_cache: SpyrePagedKVCache,
+        builder: "SpyreAttentionMetadataBuilder",
+        recorded: "set[tuple[int, int, int]]",
+        num_pages: int,
+    ) -> "tuple[int, int, int] | None":
+        """Trace the batched kernel ``bucket`` needs; None if already traced or unreachable.
+
+        Returns the ``(num_seqs, blocks_per_chunk, num_chunks)`` key the metadata
+        ``build()`` produced actually dispatches on, not ``bucket``'s own.
+        """
+        attn_metadata = builder.build_for_batched_decode_variant(bucket)
+        assert attn_metadata.padded_num_seqs is not None
+        assert attn_metadata.blocks_per_chunk is not None
+        assert attn_metadata.chunk_page_ids_cpu is not None
+        realized = (
+            attn_metadata.padded_num_seqs,
+            attn_metadata.blocks_per_chunk,
+            len(attn_metadata.chunk_page_ids_cpu),
+        )
+        # Several requested buckets realize onto one kernel: a sliding window leaves
+        # the block count unpadded. Without a window build() rounds onto the bucketer's
+        # own buckets, so a mismatch means the two have drifted and dispatch can ask
+        # for a kernel warmup never recorded.
+        requested = (bucket.num_seqs, bucket.blocks_per_chunk, bucket.num_chunks)
+        if realized != requested and builder.sliding_window is None:
+            logger.warning(
+                "Batched decode variant %s realized as %s without a sliding window; the "
+                "bucketer and build() have diverged and some shapes will compile on "
+                "first use.",
+                requested,
+                realized,
+            )
+        # The kernel gathers `entries` pages per chunk, not num_blocks of them, and
+        # selecting a whole source faults the device (torch-spyre#4033). A sliding
+        # window leaves the block count unpadded, so this keys on what build()
+        # realized, not the bucket's window-agnostic count, to skip only the
+        # variants dispatch cannot reach either.
+        if attn_metadata.padded_num_seqs * attn_metadata.blocks_per_chunk >= num_pages:
+            return None
+        if realized in recorded:
+            return None
+
         q_staging, out_staging = self._staging_buffers(kv_cache[0].device)
         self.forward(layer, q_staging, q_staging, q_staging, kv_cache, attn_metadata, out_staging)
         return realized

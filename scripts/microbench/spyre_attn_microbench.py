@@ -65,6 +65,10 @@ MEMORY_OP_MARKERS = ("memcpy", "memset", "restickify", "stickif", "copy_from_d2d
 # Spyre requires float16 (platform.py raises otherwise).
 DTYPE = torch.float16
 
+# check_and_update_config caps max_num_batched_tokens here for decoder models, so a
+# longer batch is unschedulable at any max_model_len.
+_MAX_BATCHED_TOKENS = 512
+
 
 VARIANT_REGISTRY: dict[str, dict] = {}
 
@@ -89,10 +93,10 @@ register_variant(
 def spyre_vllm_config(compiled: bool, block_size: int, limits: dict):
     """Establish a Spyre vLLM config context for standalone (non-pytest) use.
 
-    ``limits`` is explicit because the attention bucket lattice derives from it;
-    defaulted, the padding the kernel sees would be an accident of whichever model
-    ``ModelConfig()`` resolves. ``block_size`` must reach ``cache_config``, which
-    the metadata builder asserts its kv_cache_spec against.
+    ``limits`` comes from ``derive_lattice``: defaulted, the padding the kernel
+    sees would be an accident of whichever model ``ModelConfig()`` resolves.
+    ``block_size`` must reach ``cache_config``, which the metadata builder asserts
+    its kv_cache_spec against.
     """
     from vllm.config import (
         CacheConfig,
@@ -547,42 +551,36 @@ def measure(run, iterations, span=SPANS["layer"]):
     return dev_us, mem_us, cpu_us, n_kernels
 
 
-def unreachable_reason(query_lens, seq_lens, block_size) -> str:
+def unreachable_reason(query_lens) -> str:
     """Why the engine could never schedule this shape, or "" if it could.
 
-    The platform caps ``max_num_batched_tokens`` at 512 for decoder models, so a
-    longer query is unreachable at *any* max_model_len: prefills are chunked.
+    Against the platform cap, not the derived limits: those come from the shapes, so
+    they can never rule one out.
     """
-    from vllm.config import get_current_vllm_config
-
-    from spyre_inference.v1.attention.spyre_attn_bucketer import SpyreAttnBucketer
-
-    vllm_config = get_current_vllm_config()
-    bucketer = SpyreAttnBucketer(vllm_config)
-    max_batched = vllm_config.scheduler_config.max_num_batched_tokens
-    if sum(query_lens) > max_batched:
+    if sum(query_lens) > _MAX_BATCHED_TOKENS:
         return (
-            f"batch of {sum(query_lens)} tokens above max_num_batched_tokens={max_batched}; "
-            "the scheduler cannot pack this many into one step"
+            f"batch of {sum(query_lens)} tokens above the platform's "
+            f"max_num_batched_tokens cap of {_MAX_BATCHED_TOKENS}; the scheduler "
+            "cannot pack this many into one step, so production chunks it"
         )
-    if len(query_lens) > vllm_config.scheduler_config.max_num_seqs:
-        return (
-            f"{len(query_lens)} sequences above "
-            f"max_num_seqs={vllm_config.scheduler_config.max_num_seqs}"
-        )
-    for query_len, seq_len in zip(query_lens, seq_lens):
-        if bucketer.find_query_bucket(query_len) is None:
-            return (
-                f"query_len={query_len} above the top query bucket "
-                f"{bucketer.query_buckets[-1]} (max_num_batched_tokens, capped at 512)"
-            )
-        blocks = (seq_len + block_size - 1) // block_size
-        if bucketer.find_blocks_bucket(blocks) is None:
-            return (
-                f"seq_len={seq_len} needs {blocks} blocks, above the top bucket "
-                f"{bucketer.num_blocks_buckets[-1]} (max_model_len)"
-            )
     return ""
+
+
+def record_padding(row, attn_metadata, query_lens, seq_lens, block_size):
+    """Record the shape the kernel got, and flag it when that is not the one asked for."""
+    realized_blocks = [len(tiles) for tiles in attn_metadata.attention_mask_tiles]
+    realized_query = list(attn_metadata.aligned_query_lens)
+    row["num_kv_blocks_iterated"] = max(realized_blocks)
+    row["padded_query_len"] = max(realized_query)
+
+    declared_blocks = [(s + block_size - 1) // block_size for s in seq_lens]
+    declared_query = [max(1, q) for q in query_lens]
+    if realized_blocks != declared_blocks or realized_query != declared_query:
+        row["error"] = (
+            f"padding is not the identity: blocks {declared_blocks}->{realized_blocks}, "
+            f"query {declared_query}->{realized_query}"
+        )
+        print(f"    -> {row['error']}", flush=True)
 
 
 def record_attn_path(row, impl, attn_metadata, batched_variant):
@@ -658,7 +656,8 @@ def run_config(entry, variant, cfg, records, csv_path, block_size=None):
         "block_size": block_size,
         "num_blocks": num_blocks,
         "kv_layout": cfg.get("kv_layout", "slot_major_devfill"),
-        "num_kv_blocks_iterated": (max_kv + block_size - 1) // block_size,
+        "num_kv_blocks_iterated": -1,
+        "padded_query_len": -1,
         "dtype": str(DTYPE),
         "implementation": meta["impl_label"],
         "variant": variant,
@@ -690,7 +689,7 @@ def run_config(entry, variant, cfg, records, csv_path, block_size=None):
 
     inputs = None
     try:
-        unreachable = unreachable_reason(query_lens, seq_lens, block_size)
+        unreachable = unreachable_reason(query_lens)
         if unreachable:
             row["error"] = unreachable
             print(f"    -> skipped ({unreachable})", flush=True)
@@ -718,6 +717,8 @@ def run_config(entry, variant, cfg, records, csv_path, block_size=None):
             print(f"    -> skipped ({row['error']})", flush=True)
             records.append(row)
             return
+
+        record_padding(row, inputs["attn_metadata"], query_lens, seq_lens, block_size)
 
         run, output, impl = make_forward(inputs, num_q, num_kv, head_size, kv_write=row["kv_write"])
 
@@ -876,16 +877,29 @@ def _infer_type(query_lens):
     return "mixed"
 
 
-def resolve_limits(cfg, entries):
-    """Engine limits for the config context, from the config or else the shapes.
+def derive_lattice(entries):
+    """The bucket lattice that makes the builder's padding the identity.
 
-    Pin them in the config to model a specific deployment: they set the padding.
+    One bucket per declared length, so ``find_*_bucket`` returns it unchanged. The kv
+    ladder stays in tokens rather than block-aligned: ``num_blocks_buckets`` derives
+    from it through the builder's own ``ceil(len / block_size)``, so one lattice holds
+    for a whole ``block_sizes`` sweep, which ``envs`` caching on first read requires.
     """
+    kv = sorted({s for e in entries for s in e["seq_lens"]})
+    # max_num_batched_tokens is pinned, not derived: staging_rows is it plus one and
+    # those buffers are the kernel's query and output arguments, so a decode-only shape
+    # list would otherwise measure a narrower gather than production's. It joins the
+    # ladder because _resolve_buckets appends a limit its ladder tops out below.
+    # 1 is the decode rung, reached by a config that declares no wider query at all.
+    query = sorted({q for e in entries for q in e["query_lens"]} | {1, _MAX_BATCHED_TOKENS})
+    num_seqs = sorted({len(e["query_lens"]) for e in entries})
     return {
-        "max_model_len": cfg.get("max_model_len") or max(max(e["seq_lens"]) for e in entries),
-        "max_num_batched_tokens": cfg.get("max_num_batched_tokens")
-        or max(sum(e["query_lens"]) for e in entries),
-        "max_num_seqs": cfg.get("max_num_seqs") or max(len(e["query_lens"]) for e in entries),
+        "max_model_len": kv[-1],
+        "max_num_batched_tokens": _MAX_BATCHED_TOKENS,
+        "max_num_seqs": num_seqs[-1],
+        "SPYRE_ATTN_KV_BUCKETS": ",".join(map(str, kv)),
+        "SPYRE_ATTN_QUERY_BUCKETS": ",".join(map(str, query)),
+        "SPYRE_ATTN_NUM_SEQS_BUCKETS": ",".join(map(str, num_seqs)),
     }
 
 
@@ -955,9 +969,6 @@ def main():
         help="also scatter K/V into the cache each iteration, as attn_layer does, "
         "so the reshape_and_cache and layer spans have something to measure",
     )
-    ap.add_argument("--max-model-len", type=int, default=None)
-    ap.add_argument("--max-num-batched-tokens", type=int, default=None)
-    ap.add_argument("--max-num-seqs", type=int, default=None)
     ap.add_argument("--stop-on-failure", action="store_true")
     ap.add_argument("--no-output", action="store_true")
     ap.add_argument("--allow-empty-device-profile", action="store_true")
@@ -972,12 +983,28 @@ def main():
         ("span", args.span),
         ("kv_layout", args.kv_layout),
         ("kv_write", args.kv_write or None),
-        ("max_model_len", args.max_model_len),
-        ("max_num_batched_tokens", args.max_num_batched_tokens),
-        ("max_num_seqs", args.max_num_seqs),
     ):
         if val is not None:
             cfg[key] = val
+    retired = [
+        k
+        for k in (
+            "max_model_len",
+            "max_num_batched_tokens",
+            "max_num_seqs",
+            "attn_kv_buckets",
+            "attn_query_buckets",
+            "attn_num_seqs_buckets",
+        )
+        if k in cfg
+    ]
+    if retired:
+        raise SystemExit(
+            f"{args.config} sets {retired}, which no longer configure anything: the "
+            "lattice is derived from the shapes. Declare the shape you want measured; "
+            "to model a coarser deployment ladder, declare the padded length it "
+            "rounds to."
+        )
     if args.variants:
         cfg["variants"] = args.variants
     cfg["stop_on_failure"] = args.stop_on_failure
@@ -1003,16 +1030,13 @@ def main():
             "(SPYRE_BATCHED_DECODE is process-wide). Re-run with --variants one at a time."
         )
     os.environ["SPYRE_BATCHED_DECODE"] = "1" if next(iter(batched_modes)) else "0"
-    for key, env in (
-        ("attn_kv_buckets", "SPYRE_ATTN_KV_BUCKETS"),
-        ("attn_query_buckets", "SPYRE_ATTN_QUERY_BUCKETS"),
-        ("attn_num_seqs_buckets", "SPYRE_ATTN_NUM_SEQS_BUCKETS"),
-    ):
-        if cfg.get(key):
-            os.environ[env] = str(cfg[key])
 
     entries = entries_from_config(cfg)
-    limits = resolve_limits(cfg, entries)
+    limits = derive_lattice(entries)
+    # envs caches on first read, so this has to land before any bucketer is built.
+    for key, value in limits.items():
+        if key.startswith("SPYRE_"):
+            os.environ[key] = value
     sel_span = SPANS[cfg.get("span", "layer")]
     stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     out_dir = Path(args.output_dir) / cfg.get("run_label", "run") / stamp
@@ -1031,6 +1055,9 @@ def main():
     print(f"  kv write   : {bool(cfg.get('kv_write', False))}")
     print(f"  variants   : {variants}")
     print(f"  shapes     : {len(entries)}")
+    print(f"  kv buckets : {limits['SPYRE_ATTN_KV_BUCKETS']}")
+    print(f"  q buckets  : {limits['SPYRE_ATTN_QUERY_BUCKETS']}")
+    print(f"  seq buckets: {limits['SPYRE_ATTN_NUM_SEQS_BUCKETS']}")
     print(f"  iterations : {cfg.get('iterations', 10)} (warmup {cfg.get('warmup', 2)})")
     print(f"  output     : {out_dir if not args.no_output else 'none'}\n", flush=True)
 
