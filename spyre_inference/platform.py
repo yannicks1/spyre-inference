@@ -430,8 +430,12 @@ class TorchSpyrePlatform(CpuPlatform):
 
         model_config = vllm_config.model_config
         hf_config = model_config.hf_config
-        num_heads = getattr(hf_config, "num_attention_heads", None)
-        hidden_size = getattr(hf_config, "hidden_size", None)
+        # The decoder's geometry, from the text config: a multimodal checkpoint's
+        # composite config (e.g. granite-vision's LlavaNextConfig) carries neither
+        # attribute at top level, and reading it there skipped the padding entirely.
+        text_config = model_config.hf_text_config
+        num_heads = getattr(text_config, "num_attention_heads", None)
+        hidden_size = getattr(text_config, "hidden_size", None)
         if num_heads is None or hidden_size is None:
             return
 
@@ -440,7 +444,7 @@ class TorchSpyrePlatform(CpuPlatform):
         if not any(getattr(c, "rope_parameters", None) for c in cfgs):
             return
 
-        orig = getattr(hf_config, "head_dim", None) or hidden_size // num_heads
+        orig = getattr(text_config, "head_dim", None) or hidden_size // num_heads
         if orig % 128 == 0:
             return
 

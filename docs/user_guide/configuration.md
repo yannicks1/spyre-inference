@@ -47,6 +47,16 @@ That is also the configuration the tensor-parallel and compile e2e tests run the
 checkpoints under. A repository with no vision tower gets the override by default, so
 this is only needed for the multimodal ones.
 
+## Tensor parallelism needs compiled mode
+
+`--enforce-eager` with `--tensor-parallel-size > 1` fails during warmup in the
+vocab-parallel embedding's `all_reduce` (observed at both 2 and 4 ranks). The token count
+reaching that collective is the raw scheduled one, so every distinct prompt length asks the
+backend to build another collective schedule, and some of those fail to build. The 1D
+padding that keeps the count on a handful of shapes only exists to hit compiled graphs, so
+it is not installed under `--enforce-eager`. Run tensor-parallel serving compiled, which is
+the default.
+
 ## Decoder compile buckets
 
 The body pads the packed token count to the next `compile_sizes` bucket, and warmup

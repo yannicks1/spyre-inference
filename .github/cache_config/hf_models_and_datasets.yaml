@@ -50,4 +50,6 @@ public_models:
     revision: 24548b62aa021d562695c04aaf7758a1ea47990b
   - repo: google/gemma-4-26B-A4B-it
     revision: 4d7ae4984b7db7de8f8457170b3f1a419ee76d52
+  - repo: ibm-granite/granite-vision-4.1-4b
+    revision: 37d591f06319e8f1638b5adcf58bdf50e0f84f7a
   - qwrt/Swedish0.1M

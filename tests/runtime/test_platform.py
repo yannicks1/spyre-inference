@@ -229,25 +229,36 @@ def test_apply_config_sets_pooling_compile_sizes_from_token_cap():
     assert vllm_config.scheduler_config.max_num_batched_tokens == 512
 
 
-def _fake_pad_config(head_dim=64, num_heads=8, *, transformers_backend=False, **rope_attrs):
+def _fake_pad_config(
+    head_dim=64, num_heads=8, *, transformers_backend=False, composite=False, **rope_attrs
+):
     """Minimal vllm_config exposing everything _maybe_pad_head_dim touches.
 
-    hf_config and hf_text_config share one object (the common case). Returns
-    (vllm_config, hf_config, model_config) so tests can assert on mutations.
+    hf_config and hf_text_config share one object (the common case) unless
+    ``composite``, which models a multimodal checkpoint: the decoder geometry lives on
+    the text config only, and the outer config carries the vision config instead.
+    Returns (vllm_config, hf_text_config, model_config) so tests can assert on mutations.
     """
-    hf_config = SimpleNamespace(
+    hf_text_config = SimpleNamespace(
         num_attention_heads=num_heads,
         hidden_size=head_dim * num_heads,
         head_dim=head_dim,
         **rope_attrs,
     )
+    # No rope config on the composite: a real VLM keeps it on the text config, and the
+    # guard under test reads both.
+    hf_config = (
+        SimpleNamespace(vision_config=SimpleNamespace(hidden_size=1152))
+        if composite
+        else hf_text_config
+    )
     model_config = SimpleNamespace(
         hf_config=hf_config,
-        hf_text_config=hf_config,
+        hf_text_config=hf_text_config,
         model_arch_config=SimpleNamespace(head_size=head_dim),
         using_transformers_backend=lambda: transformers_backend,
     )
-    return SimpleNamespace(model_config=model_config), hf_config, model_config
+    return SimpleNamespace(model_config=model_config), hf_text_config, model_config
 
 
 def test_pad_head_dim_full_rotary_pads():
@@ -266,6 +277,33 @@ def test_pad_head_dim_full_rotary_pads():
     assert hf.head_dim == 128
     assert hf._spyre_orig_head_dim == 64
     assert mc.model_arch_config.head_size == 128
+
+
+def test_pad_head_dim_reads_a_composite_multimodal_config():
+    """A VLM's composite config carries the decoder geometry only on its text config.
+
+    granite-vision's ``Granite4VisionConfig`` (a ``LlavaNextConfig``) defines no
+    top-level ``num_attention_heads``/``hidden_size``, and transformers resolves
+    attributes through ``attribute_map`` alone -- no delegation to sub-configs -- so
+    reading them off ``hf_config`` skipped the padding for every multimodal model. Every
+    other pad pass already sources the text config; this one was left behind. Invisible
+    to the tests above, which share one config object.
+    """
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config, hf_text, mc = _fake_pad_config(
+        num_heads=40,
+        composite=True,
+        rope_parameters={"rope_type": "default", "rope_theta": 10000000.0},
+    )
+    TorchSpyrePlatform._maybe_pad_head_dim(vllm_config)
+
+    assert hf_text.head_dim == 128
+    assert hf_text._spyre_orig_head_dim == 64
+    assert mc.model_arch_config.head_size == 128
+    # The vision tower has its own head geometry and must not be widened with the
+    # decoder's; only head_dim is written onto the outer config.
+    assert mc.hf_config.vision_config.hidden_size == 1152
 
 
 def test_pad_head_dim_pads_on_the_transformers_backend():

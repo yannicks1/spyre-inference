@@ -128,20 +128,32 @@ def _pad_fused_qkv(
     )
 
 
+# Checkpoint path components that are not the decoder. A multimodal checkpoint streams
+# its vision tower through the same weight iterator, and the tower's attention has its
+# own head geometry -- SigLIP's projections are named q_proj/k_proj/v_proj too, so the
+# suffix tests below would reshape them against the decoder's head count.
+_NON_DECODER_PARTS = frozenset(("vision_tower", "vision_model", "vision_encoder", "visual"))
+
+
 def _pad_weight(
     name: str, w: torch.Tensor, n_heads: int, n_kv_heads: int, orig: int, padded: int
 ) -> torch.Tensor:
     """Dispatch a single checkpoint tensor to the right padding by its name."""
+    if not _NON_DECODER_PARTS.isdisjoint(name.split(".")):
+        return w
     # Must precede the v_proj test: "qkv_proj.weight" also ends with "v_proj.weight".
+    # Each branch below reshapes against the decoder's head count, so a tensor that is
+    # not that shape is not the tensor the branch is for -- belt and braces with the
+    # path filter above, which a tower named something else would slip past.
     if name.endswith(("qkv_proj.weight", "qkv_proj.bias")):
         return _pad_fused_qkv(w, n_heads, n_kv_heads, orig, padded)
-    if name.endswith(("q_proj.weight", "q_proj.bias")):
+    if name.endswith(("q_proj.weight", "q_proj.bias")) and w.shape[0] == n_heads * orig:
         return _pad_qk_interleaved(w, n_heads, orig, padded)
-    if name.endswith(("k_proj.weight", "k_proj.bias")):
+    if name.endswith(("k_proj.weight", "k_proj.bias")) and w.shape[0] == n_kv_heads * orig:
         return _pad_qk_interleaved(w, n_kv_heads, orig, padded)
-    if name.endswith(("v_proj.weight", "v_proj.bias")):
+    if name.endswith(("v_proj.weight", "v_proj.bias")) and w.shape[0] == n_kv_heads * orig:
         return _pad_output_end(w, n_kv_heads, orig, padded)
-    if name.endswith("o_proj.weight"):
+    if name.endswith("o_proj.weight") and w.shape[1] == n_heads * orig:
         return _pad_input_end(w, n_heads, orig, padded)
     # QK-norm (Qwen3): pad only a norm taken over head_dim; other widths are untouched.
     if name.endswith(("q_norm.weight", "k_norm.weight")) and w.numel() == orig:

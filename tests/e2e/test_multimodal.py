@@ -21,6 +21,7 @@ no meaningful reference string, so this only asserts the path runs and decodes t
 
 import io
 import sys
+from pathlib import Path
 
 import pytest
 from spyre_testing_plugin.pytest_plugin import spyre_device_count
@@ -36,6 +37,12 @@ GEMMA4_MODEL = "google/gemma-4-26B-A4B-it"
 # writes no `refs/main` — so the offline runner can only resolve it by that same sha.
 # Keep in sync with .github/cache_config/hf_models_and_datasets.yaml.
 GEMMA4_REVISION = "4d7ae4984b7db7de8f8457170b3f1a419ee76d52"
+
+# vLLM's own SigLIP tower + BLIP-2 QFormer projectors on a Granite decoder, the third
+# vision path here -- and the only one whose decoder head_dim (64) is padded for stick
+# alignment.
+GRANITE4_MODEL = "ibm-granite/granite-vision-4.1-4b"
+GRANITE4_REVISION = "37d591f06319e8f1638b5adcf58bdf50e0f84f7a"
 
 MAX_MODEL_LEN = 4096
 MAX_TOKENS = 16
@@ -209,6 +216,98 @@ def test_gemma4_single_image_prompt_produces_output(enforce_eager, monkeypatch):
     )
 
     assert text.strip(), "empty generation from the Gemma 4 vision path"
+
+
+def _skip_without_cached_model(model: str, revision: str) -> None:
+    """Skip when the shared HF cache has not prefetched all of `model`.
+
+    Checked file by file, not just by `snapshot_download` succeeding: a cache populated
+    with `allow_patterns` holds the config and the weights while the tokenizer and the
+    processor are absent, and that combination raises mid-test instead of skipping.
+    """
+    from huggingface_hub import snapshot_download
+    from huggingface_hub.errors import LocalEntryNotFoundError
+
+    try:
+        path = Path(snapshot_download(model, revision=revision, local_files_only=True))
+    except LocalEntryNotFoundError:
+        pytest.skip(f"{model}@{revision[:7]} not in the local HF cache")
+    missing = [
+        name
+        for name in ("tokenizer_config.json", "preprocessor_config.json")
+        if not (path / name).exists()
+    ]
+    if missing:
+        pytest.skip(f"{model}@{revision[:7]} is cached without {', '.join(missing)}")
+
+
+@pytest.mark.multimodal
+@pytest.mark.granite4_vision
+@pytest.mark.parametrize(
+    "enforce_eager",
+    [
+        pytest.param(True, id="eager"),
+        pytest.param(
+            False,
+            id="compiled",
+            marks=pytest.mark.disable_co_optimizing_lx_planning,
+        ),
+    ],
+)
+@pytest.mark.uses_subprocess
+def test_granite4_single_image_prompt_produces_output(enforce_eager, monkeypatch):
+    """The Granite 4 Vision encode path on card: SigLIP tower at a padded head_dim,
+    the constant-matmul patch-grid pooling, the QFormer windows on padded shapes, the
+    anyres row gather, and the deepstack features reaching the decoder.
+
+    Both modes, as for the towers above: the patches have to lower inside a graph as
+    well as eagerly, and compiled is the repo default.
+    """
+    if spyre_device_count() == 0:
+        pytest.skip("Spyre device not available")
+    _skip_without_cached_model(GRANITE4_MODEL, GRANITE4_REVISION)
+
+    monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")
+
+    uri = _synthetic_image_data_uri()
+    (text,) = _generate(
+        [_conversation(uri)],
+        enforce_eager=enforce_eager,
+        model=GRANITE4_MODEL,
+        config_format="hf",
+        revision=GRANITE4_REVISION,
+    )
+
+    assert text.strip(), "empty generation from the Granite 4 vision path"
+
+
+@pytest.mark.multimodal
+@pytest.mark.granite4_vision
+@pytest.mark.uses_subprocess
+def test_granite4_two_image_prompt_produces_output(monkeypatch):
+    """Two images make the deepstack merge concatenate per-image feature tensors, which
+    one image leaves as a no-op, and give the anyres row gather a second geometry.
+
+    Eager only: the gather index is built on the host either way, so a compiled twin
+    would cost a graph build for no new coverage.
+    """
+    if spyre_device_count() == 0:
+        pytest.skip("Spyre device not available")
+    _skip_without_cached_model(GRANITE4_MODEL, GRANITE4_REVISION)
+
+    monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")
+
+    uris = (_synthetic_image_data_uri(seed=0), _synthetic_image_data_uri(seed=97))
+    (text,) = _generate(
+        [_conversation(*uris)],
+        enforce_eager=True,
+        images_per_prompt=2,
+        model=GRANITE4_MODEL,
+        config_format="hf",
+        revision=GRANITE4_REVISION,
+    )
+
+    assert text.strip(), "empty generation from the two-image Granite 4 vision path"
 
 
 if __name__ == "__main__":

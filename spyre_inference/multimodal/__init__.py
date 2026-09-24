@@ -21,7 +21,7 @@ implementations by layer class.
 
 import torch
 
-from . import clip, gemma4_vision, pixtral
+from . import clip, gemma4_vision, granite4_vision, pixtral
 
 
 def apply_multimodal_patches(model: torch.nn.Module, device: torch.device) -> None:
@@ -39,8 +39,14 @@ def apply_multimodal_patches(model: torch.nn.Module, device: torch.device) -> No
     if vision_tower is not None:
         # Gemma4VisionModel is a stock transformers class, not vLLM's Pixtral -- dispatch
         # by class name rather than the shared `vision_tower` attribute name.
+        # Gated on model_type for the SigLIP tower: every SigLIP-based VLM builds the
+        # same `SiglipVisionModel`, and the granite-vision patches reach past the tower
+        # into projectors only this architecture has.
+        model_type = getattr(getattr(model, "config", None), "model_type", None)
         if type(vision_tower).__name__ == "Gemma4VisionModel":
             gemma4_vision.apply(model, device)
+        elif model_type == "granite4_vision":
+            granite4_vision.apply(model, device)
         else:
             pixtral.apply(model, device)
 
