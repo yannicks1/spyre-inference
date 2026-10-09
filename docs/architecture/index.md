@@ -49,13 +49,13 @@ Most layers that require Spyre-specific handling are replaced via vLLM's
 run upstream in the compiled graph). Most replacements are pure class swaps that run
 when the ops package is imported. `register_all()` additionally registers the `spyre_convert`
 custom op — the `convert` helper keeps device transfers invisible to `torch.compile`.
-RoPE registers no op — its rotation-cache gather and 2×2 rotation run directly in the
-compiled graph (see below).
+RoPE registers no op — its rotation-cache gather and rotation (2×2, or split-free for a
+sub-stick half) run directly in the compiled graph (see below).
 
 | vLLM Layer | Spyre Replacement | Device | Notes |
 |---|---|---|---|
 | `GemmaRMSNorm` | `SpyreGemmaRMSNorm` | Spyre | A `maybe_compile(force=True)` `forward_native`, so the fp32 promotion is kept. Plain `RMSNorm` needs no replacement — upstream's fp32 `forward_native` lowers eagerly — but Gemma's trailing fp32 `weight` multiply does not: a STANDARD `[hidden]` operand that torch-spyre can neither broadcast against a staggered-EA activation nor de-stagger, so the kernel has to be compiled even under `enforce_eager`. |
-| `RotaryEmbedding`, `Llama3RotaryEmbedding` | `SpyreRotaryEmbedding`, `SpyreLlama3RotaryEmbedding` | Spyre | Fully on-device, no opaque op. A device-resident 4D rotation cache (`[max_pos, 2, 2, rotary_dim//2]`) is built from `cos_sin_cache` and **primed on-device in `_apply` before `torch.compile`**; `forward_oot` then gathers this pass's per-token slice with `index_select` and applies the 2×2 rotation-matrix formulation (`_rotate_neox_2x2`) — both traced directly into the full-model compile graph. Priming before compile is the requirement: building the cache lazily inside the traced forward segfaults libsenlib during warmup, whereas a cache already materialized on-device indexes cleanly. Only neox-style full rotary is supported — other configs raise `NotImplementedError` at construction. The 2×2 inner dim `rotary_dim//2` must also be stick-aligned; this is not re-checked but is guaranteed by head-dim padding (see below) |
+| `RotaryEmbedding`, `Llama3RotaryEmbedding`, `YaRNScalingRotaryEmbedding`, `Gemma4RotaryEmbedding` | `SpyreRotaryEmbedding`, `SpyreLlama3RotaryEmbedding`, `SpyreYaRNScalingRotaryEmbedding`, `SpyreGemma4RotaryEmbedding` | Spyre | Fully on-device, no opaque op. A `[max_pos, 2, 2, rotary_dim//2]` rotation cache is built from `cos_sin_cache`, flattened to 2-D with the position axis outermost, and **primed on-device in `_apply` before `torch.compile`**; `forward_oot` then gathers this pass's per-token slice with `index_select` and applies the 2×2 rotation-matrix formulation (`_rotate_neox_2x2`) — both traced directly into the enclosing block graph. Priming before compile is the requirement: building the cache lazily inside the traced forward segfaults libsenlib during warmup, whereas a cache already materialized on-device indexes cleanly. Only neox-style full rotary is supported — other configs raise `NotImplementedError` at construction. The 2×2 form views a head as two halves, so it needs a stick-aligned `rotary_dim//2`. A head whose half is sub-stick (`head_size=64`) takes `_rotate_neox_split_free` instead: `x * cos + rotate_half(x) * sin`, with `rotate_half` as a matmul by a fixed signed permutation, so every view is a whole head. Its cache is `[max_pos, 2 * head_size]`, laid out `[cos \| cos \| sin \| sin]`. Head-dim padding then only has to make a head stick-aligned, so the native path pads to the next 64-multiple |
 | `VocabParallelEmbedding` | `SpyreVocabParallelEmbedding` | Spyre (TP tables built on CPU at load) | The weight moves to Spyre with the model and the embedding gather runs on-device (`aten.embedding` now has a Spyre kernel, torch-spyre#420). TP=1 gathers directly. When TP>1, the per-vocab reindex/keep tables are built once on CPU at load and registered as device buffers; `forward` derives `masked_input`/`keep` from them on-device (`index_select`/`F.embedding`), applies the keep mask, and `all_reduce`s — no per-step CPU round-trip |
 | `ColumnParallelLinear`, `MergedColumnParallelLinear`, `QKVParallelLinear`, `RowParallelLinear`, `ReplicatedLinear` | `SpyreColumnParallelLinear`, `SpyreMergedColumnParallelLinear`, `SpyreQKVParallelLinear`, `SpyreRowParallelLinear`, `SpyreReplicatedLinear` | Spyre | All five swap in `SpyreUnquantizedLinearMethod` (the transposed-weight fast path below). `SpyreQKVParallelLinear` additionally asserts `gather_output=False`; `SpyreRowParallelLinear` (`o_proj`, `down_proj`) inherits upstream's `all_reduce` when `reduce_results=True` under TP>1 |
 | `SiluAndMul` | — (not replaced) | Spyre | No OOT class: vLLM's own `SiluAndMul` is traced into the compiled graph, so `silu(gate)·up` runs on Spyre and slices the fused `[..., 2*d]` on-device. The Spyre-specific piece is `mlp_pad.py`, which zero-pads `intermediate_size` to the 64-element stick at load time so that slice lands at a lowerable offset (inert since `silu(0) = 0`) |
@@ -306,7 +306,7 @@ Key constraints:
   (consistent tensor shapes for compilation)
 - **Num-sequences bucketing** (batched-decode kernel only, `SPYRE_BATCHED_DECODE=1`, the
   default; under the default tiled walk, the head-major layout only):
-  powers of two from 4 to `max_num_seqs` (`SPYRE_ATTN_NUM_SEQS_BUCKETS`); the decode-batch
+  powers of two from 1 to `max_num_seqs` (`SPYRE_ATTN_NUM_SEQS_BUCKETS`); the decode-batch
   kernel is recorded over the `(num_blocks, num_seqs)` grid
 - **Head size**: Must be a multiple of 64 (128-byte Spyre stick ÷ 2-byte float16)
 - **Block size**: Must be a multiple of 64. The default is 128, and a user-supplied
@@ -446,10 +446,12 @@ The subclass covers what upstream leaves to HF's module code. There is no RoPE f
 HF's `rotary_emb` survives and would derive cos/sin inside the forward from int64
 `position_ids`, a cast torch-spyre cannot lower. It is replaced with a precomputed
 `[max_model_len, 2, 2, head_dim/2]` rotation cache — built on the host and moved to the
-device before compile, leaving only an `index_select` in the graph — plus a matmul-based
-`apply_rotary_pos_emb`. Head padding is shared with the native path: the platform widens
-`head_dim` and the weight passes in `head_pad.py` pad Q/K interleaved, so this backend
-only has to rebuild the rotation cache at the pre-pad frequencies.
+device before compile, leaving only an `index_select` in the graph — plus an
+`apply_rotary_pos_emb` that applies the 2×2 rotation by multiply-and-reduce rather than
+HF's `rotate_half` slicing. That rotation still views a head as two halves, so here the
+platform widens `head_dim` to the next 128-multiple, not the native path's 64-multiple. The
+weight passes in `head_pad.py` are shared with the native path and pad Q/K interleaved, so
+this backend only has to rebuild the rotation cache at the pre-pad frequencies.
 
 `RMSNorm` registers no OOT op: upstream `forward_native` lowers its fp16→fp32 upcast
 into the compiled graph. `GemmaRMSNorm` still needs one, because its trailing fp32
