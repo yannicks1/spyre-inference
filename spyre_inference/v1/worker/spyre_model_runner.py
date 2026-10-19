@@ -1146,6 +1146,23 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 builders[layer_name] = builder
         return builders
 
+    def maybe_add_kv_sharing_layers_to_kv_cache_groups(self, kv_cache_config) -> None:
+        """Also give each KV-sharing layer its target's spec, which upstream omits from a
+        group's ``UniformTypeKVCacheSpecs`` (the per-layer lookup then KeyErrors)."""
+        from dataclasses import replace
+
+        from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
+
+        super().maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
+        for group in kv_cache_config.kv_cache_groups:
+            spec = group.kv_cache_spec
+            if isinstance(spec, UniformTypeKVCacheSpecs):
+                specs = dict(spec.kv_cache_specs)
+                for layer, target in self.shared_kv_cache_layers.items():
+                    if target in specs:
+                        specs[layer] = specs[target]
+                group.kv_cache_spec = replace(spec, kv_cache_specs=specs)
+
     def initialize_attn_backend(self, kv_cache_config, is_profiling: bool = False) -> None:
         super().initialize_attn_backend(kv_cache_config, is_profiling=is_profiling)
         self._split_attn_groups_by_layer_window()

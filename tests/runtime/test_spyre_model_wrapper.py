@@ -18,6 +18,12 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    UniformTypeKVCacheSpecs,
+)
 
 from spyre_inference.v1.worker import spyre_model_runner as mr
 
@@ -48,6 +54,36 @@ def test_wrapper_converts_ints_to_int64(monkeypatch):
     assert seen == [torch.int64, torch.int64]
     assert out["input_ids"].dtype == torch.int64
     assert out["positions"].dtype == torch.int64
+
+
+def test_kv_sharing_layer_gets_its_target_spec(monkeypatch):
+    """Upstream adds a KV-sharing layer to its target's group but not to the group's
+    per-layer specs, so `initialize_attn_backend`'s per-layer lookup would KeyError."""
+    owner, sharing = "layers.0.self_attn", "layers.1.self_attn"
+    spec = FullAttentionSpec(block_size=128, num_kv_heads=2, head_size=128, dtype=torch.float16)
+    uniform = UniformTypeKVCacheSpecs.from_specs({owner: spec})
+    assert uniform is not None
+    config = KVCacheConfig(
+        num_blocks=2,
+        kv_cache_tensors=[],
+        kv_cache_groups=[KVCacheGroupSpec(layer_names=[owner], kv_cache_spec=uniform)],
+    )
+    runner = mr.TorchSpyreModelRunner.__new__(mr.TorchSpyreModelRunner)
+    runner.shared_kv_cache_layers = {sharing: owner}
+
+    def upstream_add(_self, kv_cache_config):
+        kv_cache_config.kv_cache_groups[0].layer_names.append(sharing)
+
+    monkeypatch.setattr(
+        mr.GPUModelRunner, "maybe_add_kv_sharing_layers_to_kv_cache_groups", upstream_add
+    )
+
+    runner.maybe_add_kv_sharing_layers_to_kv_cache_groups(config)
+
+    group = config.kv_cache_groups[0]
+    assert group.layer_names == [owner, sharing]
+    assert group.kv_cache_spec.kv_cache_specs == {owner: spec, sharing: spec}
+    assert uniform.kv_cache_specs == {owner: spec}, "the frozen original must be untouched"
 
 
 def test_wrapper_recursively_converts_integer_inputs(monkeypatch):
