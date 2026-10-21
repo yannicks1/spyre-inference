@@ -26,7 +26,7 @@ from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.worker.gpu_worker import Worker, init_worker_distributed_environment
 from vllm.v1.worker.worker_base import CompilationTimes
 
-from spyre_inference import envs
+from spyre_inference import envs, keep_sigterm_handler
 from spyre_inference.custom_ops import register_all
 from spyre_inference.models import register_models
 from spyre_inference.platform import _raise_dynamo_recompile_limits
@@ -104,7 +104,8 @@ class TorchSpyreWorker(Worker):
         # TORCH_DEVICE_BACKEND_AUTOLOAD=0 disabled that.
         import torch_spyre
 
-        torch_spyre._autoload()
+        with keep_sigterm_handler():
+            torch_spyre._autoload()
 
         # torch_spyre's autoload sets cache_size_limit=1024, undoing the limits
         # platform.py raised at import.
@@ -197,7 +198,14 @@ class TorchSpyreWorker(Worker):
         pass
 
     @override
-    def profile(self, is_start: bool = True, profile_prefix: str | None = None):
+    def profile(
+        self,
+        is_start: bool = True,
+        profile_prefix: str | None = None,
+        *,
+        delay_iterations: int | None = None,
+        max_iterations: int | None = None,
+    ):
         if (
             is_start
             and self.profiler is None
@@ -215,4 +223,9 @@ class TorchSpyreWorker(Worker):
             )
             logger.debug("Starting torch profiler with trace name: %s", trace_name)
 
-        return super().profile(is_start, profile_prefix)
+        return super().profile(
+            is_start,
+            profile_prefix,
+            delay_iterations=delay_iterations,
+            max_iterations=max_iterations,
+        )

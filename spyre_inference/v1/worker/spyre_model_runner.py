@@ -153,10 +153,8 @@ def _compute_slot_mapping_impl(
     positions: torch.Tensor,
     block_table: torch.Tensor,
     block_table_stride: int,
-    block_size: int,
     slot_mapping: torch.Tensor,
-    KV_CACHE_BLOCK_SIZE: int | None = None,
-    BLOCKS_PER_KV_BLOCK: int = 1,
+    KV_CACHE_BLOCK_SIZE: int,
     TOTAL_CP_WORLD_SIZE: int = 1,
     TOTAL_CP_RANK: int = 0,
     CP_KV_CACHE_INTERLEAVE_SIZE: int = 1,
@@ -172,17 +170,12 @@ def _compute_slot_mapping_impl(
 
     Correctness is validated indirectly by the upstream attention backend test
     (test_causal_backend_correctness) and end-to-end model generation tests.
-
-    ``block_size`` is the kernel's block size, ``KV_CACHE_BLOCK_SIZE`` the KV
-    manager's, and ``BLOCKS_PER_KV_BLOCK`` the ratio between them (1 on Spyre).
     """
     assert TOTAL_CP_WORLD_SIZE == 1, "Context Parallelism is not supported on Spyre."
-    kv_block_size = block_size if KV_CACHE_BLOCK_SIZE is None else KV_CACHE_BLOCK_SIZE
 
     token_positions = positions[:num_tokens]
-    virtual_block_indices = (token_positions // kv_block_size).to(torch.int64)
-    local_block_offsets = (token_positions % kv_block_size).to(torch.int64)
-    block_indices = virtual_block_indices * BLOCKS_PER_KV_BLOCK + local_block_offsets // block_size
+    block_indices = (token_positions // KV_CACHE_BLOCK_SIZE).to(torch.int64)
+    block_offsets = (token_positions % KV_CACHE_BLOCK_SIZE).to(torch.int64)
 
     num_reqs = query_start_loc.shape[0] - 1
     req_indices = torch.empty(num_tokens, dtype=torch.int64, device=positions.device)
@@ -193,7 +186,7 @@ def _compute_slot_mapping_impl(
 
     flat_indices = req_indices * block_table_stride + block_indices
     block_numbers = block_table.flatten()[flat_indices].to(torch.int64)
-    slot_mapping[:num_tokens] = block_numbers * block_size + local_block_offsets % block_size
+    slot_mapping[:num_tokens] = block_numbers * KV_CACHE_BLOCK_SIZE + block_offsets
     if num_tokens < max_num_tokens:
         slot_mapping[num_tokens:max_num_tokens] = PAD_ID
 
@@ -211,10 +204,8 @@ class _SlotMappingKernelShim:
         positions: torch.Tensor,
         block_table: torch.Tensor,
         block_table_stride: int,
-        block_size: int,
         slot_mapping: torch.Tensor,
-        KV_CACHE_BLOCK_SIZE: int | None = None,
-        BLOCKS_PER_KV_BLOCK: int = 1,
+        KV_CACHE_BLOCK_SIZE: int,
         TOTAL_CP_WORLD_SIZE: int = 1,
         TOTAL_CP_RANK: int = 0,
         CP_KV_CACHE_INTERLEAVE_SIZE: int = 1,
@@ -226,10 +217,8 @@ class _SlotMappingKernelShim:
             positions,
             block_table,
             block_table_stride,
-            block_size,
             slot_mapping,
-            KV_CACHE_BLOCK_SIZE=KV_CACHE_BLOCK_SIZE,
-            BLOCKS_PER_KV_BLOCK=BLOCKS_PER_KV_BLOCK,
+            KV_CACHE_BLOCK_SIZE,
             TOTAL_CP_WORLD_SIZE=TOTAL_CP_WORLD_SIZE,
             TOTAL_CP_RANK=TOTAL_CP_RANK,
             CP_KV_CACHE_INTERLEAVE_SIZE=CP_KV_CACHE_INTERLEAVE_SIZE,
@@ -1346,7 +1335,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         num_reqs: int,
         num_scheduled_tokens_np: np.ndarray,
         max_num_scheduled_tokens: int,
-        use_cascade_attn: bool,
+        use_cascade_attn: bool = False,
         allow_microbatching: bool = True,
         force_eager: bool = False,
         force_uniform_decode: bool | None = None,
@@ -1382,7 +1371,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
             num_reqs=num_reqs,
             num_scheduled_tokens_np=num_scheduled_tokens_np,
             max_num_scheduled_tokens=max_num_scheduled_tokens,
-            use_cascade_attn=use_cascade_attn,
             allow_microbatching=allow_microbatching,
             force_eager=force_eager,
             force_uniform_decode=force_uniform_decode,
@@ -1973,10 +1961,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
     # --- Stubs copied from CPUModelRunner ---
     # These are trivial overrides that GPUModelRunner expects.
-
-    def _init_device_properties(self) -> None:
-        # No CUDA/GPU device properties to query for Spyre
-        pass
 
     def _sync_device(self) -> None:
         # Wait for outstanding async H2D from SpyreCpuGpuBuffer.copy_to_gpu
