@@ -89,11 +89,6 @@ def test_ple_self_decoder_is_retyped(monkeypatch):
     assert type(model.model.self_decoder) is gemma4.SpyreGemma4SelfDecoderLayers
 
 
-def test_masked_per_layer_vocab_is_rejected(monkeypatch):
-    with pytest.raises(NotImplementedError, match="vocab_size_per_layer_input"):
-        _build(monkeypatch, per_layer_vocab=8)
-
-
 def test_checkpoint_without_per_layer_embeddings_keeps_upstream_decoder(monkeypatch):
     model = _build(monkeypatch, per_layer_vocab=8, ple=False)
     assert type(model.model.self_decoder) is upstream.Gemma4SelfDecoderLayers

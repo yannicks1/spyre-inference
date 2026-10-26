@@ -158,10 +158,7 @@ Three adaptations worth knowing:
   the expert forms into its own graph; an eager run dispatches them to compiled regions.
 
 - **Gemma-4 per-layer embeddings** (`models/gemma4.py`, E2B / E4B) retype the self-decoder
-  to `SpyreGemma4SelfDecoderLayers`. It drops upstream's in-vocab mask on the PLE lookup,
-  which has no Spyre lowering (`aten::logical_and`) and is a no-op when every token has a
-  per-layer row, so a narrower `vocab_size_per_layer_input` is rejected at construction. It
-  also cuts the backbone's per-layer rows in one compiled graph and hands each block its own
+  to `SpyreGemma4SelfDecoderLayers`. It cuts the backbone's per-layer rows in one compiled graph and hands each block its own
   offset-0 row through the `[:, layer_idx, :]` the backbone loop already does: a view of the
   packed tensor carries a different `storage_offset` per layer, which torch-spyre guards on,
   so every layer would compile its own block. The multimodal wrapper allocates its PLE cache
