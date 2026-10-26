@@ -196,6 +196,11 @@ class _PerLayerRows(torch.Tensor):
 
 
 class SpyreGemma4SelfDecoderLayers(CompileOutermost, Gemma4SelfDecoderLayers):
+    @maybe_compile(force=True)
+    def get_per_layer_inputs(self, input_ids: torch.Tensor) -> torch.Tensor | None:
+        # The upstream mask needs a compiled region even outside decoder blocks.
+        return super().get_per_layer_inputs(input_ids)
+
     @maybe_compile
     def split_per_layer_inputs(self, ple: torch.Tensor) -> tuple[torch.Tensor, ...]:
         # One graph: L eager clones would cost L host launches per step.

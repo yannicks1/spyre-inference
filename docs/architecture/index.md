@@ -158,13 +158,16 @@ Three adaptations worth knowing:
   the expert forms into its own graph; an eager run dispatches them to compiled regions.
 
 - **Gemma-4 per-layer embeddings** (`models/gemma4.py`, E2B / E4B) retype the self-decoder
-  to `SpyreGemma4SelfDecoderLayers`. It cuts the backbone's per-layer rows in one compiled graph and hands each block its own
-  offset-0 row through the `[:, layer_idx, :]` the backbone loop already does: a view of the
-  packed tensor carries a different `storage_offset` per layer, which torch-spyre guards on,
-  so every layer would compile its own block. The multimodal wrapper allocates its PLE cache
-  on the host as a plain attribute, so `multimodal/gemma4_vision.py` moves it to the device;
-  that path runs even text-only, since the default load keeps the wrapper with every modality
-  at 0.
+  to `SpyreGemma4SelfDecoderLayers`. Its upstream PLE lookup, including the in-vocab mask,
+  always runs in a compiled region, including under `--enforce-eager`; an enclosing graph
+  absorbs it rather than nesting a compile. The lookup and row-splitting methods cache
+  their compiled callables independently. It cuts the backbone's per-layer rows in one
+  compiled graph and hands each block its own offset-0 row through the `[:, layer_idx, :]`
+  the backbone loop already does. A view of the packed tensor carries a different
+  `storage_offset` per layer, which torch-spyre guards on, so every layer would compile
+  its own block. The multimodal wrapper allocates its PLE cache on the host as a plain
+  attribute, so `multimodal/gemma4_vision.py` moves it to the device; that path runs even
+  text-only, since the default load keeps the wrapper with every modality at 0.
 
 ### MoE expert weights
 
