@@ -643,9 +643,7 @@ call boundary:
 - **Input**: CPU `int32`/`int64` tensors → Spyre `int64` (for embedding lookup)
 - **Output**: a generative model's hidden states stay on Spyre. Upstream's
   `hidden_states[logits_indices]` gathers the sampled rows on Spyre, with the index
-  padded onto a warmed row bucket in `_prepare_inputs`; a decode step on its own row
-  bucket indexes with `slice(None)`, reusing the padded body output with no gather. A
-  pooling model whose pooler
+  padded onto a warmed row bucket in `_prepare_inputs`. A pooling model whose pooler
   runs on Spyre keeps its hidden states there too, and the pooler copies back only the
   pooled vectors. Every other output, including the eager decoder's, which has no shape
   bucketer, is converted to CPU
