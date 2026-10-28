@@ -24,112 +24,76 @@ from spyre_inference.v1.worker import spyre_model_runner as mr
 ROWS, HIDDEN = 16, 8
 
 
-def _hidden(monkeypatch, buckets):
-    widths: list[int] = []
-
-    def fake_select_rows(hidden_states, row_indices):
-        assert type(hidden_states) is torch.Tensor
-        widths.append(int(row_indices.numel()))
-        return torch.index_select(hidden_states, 0, row_indices)
-
-    monkeypatch.setattr(mr, "select_rows", fake_select_rows)
-    plain = torch.randn(ROWS, HIDDEN, dtype=torch.float16)
-    return plain, mr._SpyreHiddenStates.wrap(plain, buckets), widths
-
-
-def test_index_gathers_the_requested_rows_on_a_warmed_width(monkeypatch):
-    plain, hidden, widths = _hidden(monkeypatch, [1, 2, 4, 8])
-    idx = torch.tensor([3, 9, 15])
-
-    rows = hidden[idx]
-
-    assert widths == [4]
-    assert type(rows) is torch.Tensor
-    torch.testing.assert_close(rows, plain[idx])
-    assert rows._spyre_padded_rows.shape[0] == 4
+def _wrapper(buckets, projected):
+    model = types.SimpleNamespace(
+        compute_logits=lambda rows: projected.append(rows.shape[0]) or rows
+    )
+    return mr._SpyreModelWrapper(
+        model,
+        torch.device("cpu"),
+        logits_row_buckets=buckets,
+        model_dtype=torch.float16,
+        sample_rows_on_device=True,
+    )
 
 
-def test_an_exact_width_is_marked_with_its_own_rows(monkeypatch):
-    plain, hidden, widths = _hidden(monkeypatch, [1, 2, 4])
-    idx = torch.tensor([0, 5])
+@pytest.mark.parametrize(
+    "indices,padded", [([3, 9, 15], [3, 9, 15, 15]), ([0, 5], [0, 5]), ([], [])]
+)
+def test_the_sampled_index_is_padded_onto_a_row_bucket(indices, padded):
+    wrapper = _wrapper([1, 2, 4, 8], [])
 
-    rows = hidden[idx]
-
-    assert widths == [2]
-    assert rows._spyre_padded_rows.shape[0] == 2
-    torch.testing.assert_close(rows, plain[idx])
+    assert wrapper.pad_sampled_rows(torch.tensor(indices, dtype=torch.int64)).tolist() == padded
 
 
-@pytest.mark.parametrize("num_rows", [1, 3, 4])
-def test_decode_reuses_the_body_bucket_without_a_gather(monkeypatch, num_rows):
-    plain, _, widths = _hidden(monkeypatch, [1, 2, 4, 8, 16])
-    size = 1 << (num_rows - 1).bit_length()
-    hidden = mr._SpyreHiddenStates.wrap(plain[:size], [1, 2, 4, 8, 16])
-
-    rows = hidden[torch.arange(num_rows)]
-
-    assert widths == []
-    assert rows.data_ptr() == plain.data_ptr()
-    torch.testing.assert_close(rows, plain[:num_rows])
-    assert getattr(rows, "_spyre_padded_rows", rows).shape[0] == size
-
-
-@pytest.mark.parametrize("indices", [[2, 0, 1], [0, 0, 2], [1, 2, 3]])
-def test_a_decode_sized_nonidentity_index_still_gathers(monkeypatch, indices):
-    plain, _, widths = _hidden(monkeypatch, [1, 2, 4])
-    hidden = mr._SpyreHiddenStates.wrap(plain[:4], [1, 2, 4])
-    idx = torch.tensor(indices)
-
-    rows = hidden[idx]
-
-    assert widths == [4]
-    torch.testing.assert_close(rows, plain[idx])
-
-
-def test_empty_index_does_not_try_to_repeat_a_missing_row(monkeypatch):
-    _, hidden, widths = _hidden(monkeypatch, [1, 2, 4])
-
-    rows = hidden[torch.empty(0, dtype=torch.int64)]
-
-    assert rows.shape == (0, HIDDEN)
-    assert widths == []
-
-
-def test_slices_and_ops_return_plain_tensors(monkeypatch):
-    plain, hidden, widths = _hidden(monkeypatch, [1, 2, 4])
-
-    for out in (hidden[:4], hidden[2:6], hidden + 1, torch.rand_like(hidden)):
-        assert type(out) is torch.Tensor
-    torch.testing.assert_close(hidden[2:6], plain[2:6])
-    assert widths == []
-
-
-def _runner():
+def test_compute_logits_projects_the_padded_gather_and_trims_it():
     projected: list[int] = []
-    model = types.SimpleNamespace(compute_logits=lambda rows: projected.append(rows.shape[0]))
-    return types.SimpleNamespace(model=model), projected
+    wrapper = _wrapper([1, 2, 4, 8], projected)
+    hidden = torch.randn(ROWS, HIDDEN, dtype=torch.float16)
+
+    logits = wrapper.compute_logits(hidden[wrapper.pad_sampled_rows(torch.tensor([3, 9, 15]))])
+
+    assert projected == [4]
+    torch.testing.assert_close(logits, hidden[[3, 9, 15]])
 
 
-def test_warmup_compiles_every_row_bucket_a_body_bucket_holds(monkeypatch):
+def test_warmup_compiles_every_row_bucket_a_body_bucket_holds():
     """The lm_head sees the gather's output, so it compiles on the gathered layout."""
-    _, hidden, widths = _hidden(monkeypatch, [1, 2, 4, 16, 32])
-    runner, projected = _runner()
+    projected: list[int] = []
+    runner = types.SimpleNamespace(model=_wrapper([1, 2, 4, 16, 32], projected))
+    hidden = torch.randn(ROWS, HIDDEN, dtype=torch.float16)
 
     mr.TorchSpyreModelRunner._warm_sample_row_gathers(runner, hidden, [1, 2, 4, 16, 32])
 
-    assert widths == [1, 2, 4, 16]
     assert projected == [1, 2, 4, 16, 16]
 
 
-def test_warmup_skips_hidden_states_left_on_the_host(monkeypatch):
-    _, _, widths = _hidden(monkeypatch, [1, 2])
-    runner, projected = _runner()
+@pytest.mark.parametrize("num_tokens,skips", [(3, True), (40, False)])
+def test_only_decode_on_its_own_row_bucket_skips_the_gather(monkeypatch, num_tokens, skips):
+    runner = object.__new__(mr.TorchSpyreModelRunner)
+    runner.model = _wrapper([1, 2, 4], [])
+    runner.spyre_shape_bucketer = types.SimpleNamespace(
+        warmed_bucket=lambda n: next(b for b in (1, 2, 4, 512) if b >= n)
+    )
+    monkeypatch.setattr(
+        mr.GPUModelRunner, "_prepare_inputs", lambda *a, **k: (torch.tensor([0, 1, 2]), None, 1)
+    )
+    scheduler_output = types.SimpleNamespace(total_num_scheduled_tokens=num_tokens)
+
+    index, *_ = runner._prepare_inputs(scheduler_output)
+
+    assert (index == slice(None)) is skips
+
+
+def test_warmup_skips_a_runner_that_samples_on_the_host():
+    projected: list[int] = []
+    runner = types.SimpleNamespace(model=_wrapper([1, 2], projected))
+    object.__setattr__(runner.model, "_sample_rows_on_device", False)
 
     mr.TorchSpyreModelRunner._warm_sample_row_gathers(
         runner, torch.zeros(ROWS, HIDDEN, dtype=torch.float16), [1, 2]
     )
 
-    assert widths == []
     assert projected == []
 
 
