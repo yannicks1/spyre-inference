@@ -65,24 +65,7 @@ def test_warmup_compiles_every_row_bucket_a_body_bucket_holds():
 
     mr.TorchSpyreModelRunner._warm_sample_row_gathers(runner, hidden, [1, 2, 4, 16, 32])
 
-    assert projected == [1, 2, 4, 16, 16]
-
-
-@pytest.mark.parametrize("num_tokens,skips", [(3, True), (40, False)])
-def test_only_decode_on_its_own_row_bucket_skips_the_gather(monkeypatch, num_tokens, skips):
-    runner = object.__new__(mr.TorchSpyreModelRunner)
-    runner.model = _wrapper([1, 2, 4], [])
-    runner.spyre_shape_bucketer = types.SimpleNamespace(
-        warmed_bucket=lambda n: next(b for b in (1, 2, 4, 512) if b >= n)
-    )
-    monkeypatch.setattr(
-        mr.GPUModelRunner, "_prepare_inputs", lambda *a, **k: (torch.tensor([0, 1, 2]), None, 1)
-    )
-    scheduler_output = types.SimpleNamespace(total_num_scheduled_tokens=num_tokens)
-
-    index, *_ = runner._prepare_inputs(scheduler_output)
-
-    assert (index == slice(None)) is skips
+    assert projected == [1, 2, 4, 16]
 
 
 def test_warmup_skips_a_runner_that_samples_on_the_host():

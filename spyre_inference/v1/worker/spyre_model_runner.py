@@ -1359,22 +1359,11 @@ class TorchSpyreModelRunner(GPUModelRunner):
             if rows <= hidden_states.shape[0]:
                 indices = torch.arange(rows, dtype=torch.int64)
                 model.compute_logits(hidden_states[model.pad_sampled_rows(indices)])
-                if rows == hidden_states.shape[0]:
-                    # Decode projects the padded body itself, not a gather of it.
-                    model.pad_sampled_rows(indices)
-                    model.compute_logits(hidden_states)
 
-    def _prepare_inputs(self, scheduler_output, *args, **kwargs):
-        logits_indices, *rest = super()._prepare_inputs(scheduler_output, *args, **kwargs)
+    def _prepare_inputs(self, *args, **kwargs):
+        logits_indices, *rest = super()._prepare_inputs(*args, **kwargs)
         if isinstance(self.model, _SpyreModelWrapper) and self.model._sample_rows_on_device:
-            num_tokens = scheduler_output.total_num_scheduled_tokens
-            padded = self.model.pad_sampled_rows(logits_indices)
-            # Decode samples every token; on its own row bucket the padded body is the gather.
-            if num_tokens == logits_indices.numel() and self.spyre_shape_bucketer.warmed_bucket(
-                num_tokens
-            ) == len(padded):
-                padded = slice(None)
-            logits_indices = padded
+            logits_indices = self.model.pad_sampled_rows(logits_indices)
         return logits_indices, *rest
 
     @torch.inference_mode()
