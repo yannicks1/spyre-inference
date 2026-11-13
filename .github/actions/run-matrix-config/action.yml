@@ -175,6 +175,13 @@ runs:
       run: |
         .venv/bin/python -c "from spyre_inference.v1.sample.sampling_kernels import has_sampling_kernels; assert has_sampling_kernels(), 'the sampling kernels did not build or load; see the Build spyre-inference step'"
 
+    # The images have no Rust toolchain, so the build above leaves out vLLM's optional vllm-rs; take it from the same vLLM version's PyPI wheel so the Rust-frontend tests run instead of skipping. x86_64 only (the script no-ops elsewhere); best effort, since those tests skip without it. Drop once the images build vllm-rs.
+    - name: Fetch the vllm-rs binary
+      if: ${{ inputs.use_prebaked_image != 'true' }}
+      continue-on-error: true
+      shell: bash
+      run: .venv/bin/python -I .github/scripts/fetch_vllm_rs.py
+
     # Same gate as the build step above: on a prebaked run there is no freshly-built workspace venv to point at, and repointing would send tests at an incomplete one instead of the complete baked one.
     - name: Activate the freshly-built venv
       if: ${{ inputs.use_prebaked_image != 'true' }}
