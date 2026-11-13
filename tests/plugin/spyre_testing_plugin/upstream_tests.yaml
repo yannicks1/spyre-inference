@@ -141,6 +141,8 @@ tests:
         - test: "test_gsm8k_correctness"
           mode: mandatory_pass
           tags: [gsm8k, upstream, uses_subprocess]
+          fixture_names:
+            - "skip_without_rust_frontend"
 
     - rel_path: tests/models/language/pooling/test_embedding.py
       allow_list:

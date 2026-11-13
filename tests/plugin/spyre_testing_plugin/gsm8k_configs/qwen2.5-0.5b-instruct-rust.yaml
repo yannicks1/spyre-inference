@@ -1,0 +1,15 @@
+# qwen2.5-0.5b-instruct.yaml served through vLLM's Rust frontend (vllm-rs): same model,
+# eval and gate, so a gap between the two configs is the frontend's. Skips when vLLM was
+# built without the vllm-rs binary (skip_without_rust_frontend in upstream_tests.yaml).
+# request_timeout_seconds is a *total* per-request budget (incl. queue-wait), so it must exceed the whole batched run's wall-clock.
+model_name: "Qwen/Qwen2.5-0.5B-Instruct"
+accuracy_threshold: 0.28
+tolerance: 0.08
+num_questions: 64
+num_fewshot: 5
+max_concurrency: 4
+server_args: "--max-model-len 4096"
+request_timeout_seconds: 2400
+startup_max_wait_seconds: 1800
+env:
+  VLLM_USE_RUST_FRONTEND: "1"

@@ -94,6 +94,7 @@ from spyre_testing_plugin.models import (
     Tolerances,
     UpstreamTestConfig,
 )
+from spyre_testing_plugin.rust_frontend import require_rust_frontend
 from spyre_testing_plugin.tags import result_tags
 from spyre_testing_plugin.vfio_reaper import (
     reap_vfio_holders,
@@ -1162,6 +1163,18 @@ def register_ministral_14b(request, monkeypatch):
         "ministral-3-14b",
         "mistralai/Ministral-3-14B-Instruct-2512-BF16",
     )
+
+
+@pytest.fixture()
+def skip_without_rust_frontend(config_filename):
+    """Skip a gsm8k config whose `env` turns on the Rust frontend when there is no vllm-rs.
+
+    Upstream's harness serves with no binary check of its own, so the server would die at
+    startup on vLLM's missing-binary error instead.
+    """
+    env = (yaml.safe_load(config_filename.read_text()) or {}).get("env") or {}
+    if str(env.get("VLLM_USE_RUST_FRONTEND", "0")) != "0":
+        require_rust_frontend()
 
 
 @pytest.fixture()
