@@ -162,6 +162,17 @@ class SpyrePagedKVCache(NamedTuple):
     v_pages: torch.Tensor
 
 
+def _mirror_once(attn_metadata: "SpyreAttentionMetadata", host: object, upload: Callable):
+    """``upload()`` once per host object per step, shared by every metadata on the cache."""
+    cache = attn_metadata.mirror_cache
+    hit = cache.get(id(host))
+    if hit is None or hit[0] is not host:
+        # Keeping ``host`` alive in the entry stops its id from being reused.
+        hit = (host, upload())
+        cache[id(host)] = hit
+    return hit[1]
+
+
 def _mirror_mask_stack(
     attn_metadata: "SpyreAttentionMetadata", seq_idx: int, device: torch.device
 ) -> torch.Tensor:
@@ -180,12 +191,14 @@ def _mirror_mask_stack(
     if stack_device is None:
         _, query_rows, block_size = stack_cpu.shape
         # Singleton strides must match between recorded and serving masks.
-        stack_cpu = stack_cpu.contiguous().as_strided(
+        strided = stack_cpu.contiguous().as_strided(
             stack_cpu.shape, (query_rows * block_size, block_size, 1)
         )
         # `convert` copies, so even a nonzero-offset host view arrives contiguous at
         # offset 0, ready for an in-graph dim-0 slice.
-        stack_device = convert(stack_cpu, device=device)
+        stack_device = _mirror_once(
+            attn_metadata, stack_cpu, lambda: convert(strided, device=device)
+        )
         stacks_device[seq_idx] = stack_device
     return stack_device
 
@@ -286,6 +299,47 @@ def _run_with_capped_cores(output_units: int, fn: Callable[..., _T], /, *args, *
 
     # Config overrides are context-local; leave the caller's unset state intact.
     return copy_context().run(run)
+
+
+def _page_index_tables(
+    block_table: torch.Tensor, num_active: list[int], active_block_indices: list[list[int]] | None
+) -> list[torch.Tensor]:
+    tables = []
+    for s, n in enumerate(num_active):
+        blocks_s = slice(n) if active_block_indices is None else active_block_indices[s]
+        table = torch.zeros(n, INT32_ELEMS_PER_STICK, dtype=torch.int32)
+        table[:, 0] = block_table[s, blocks_s]
+        tables.append(table)
+    return tables
+
+
+def _chunk_page_ids(
+    members: list[int],
+    b_seqs: int,
+    b_blocks: int,
+    padded_batch_blocks: int,
+    decode_blocks: list[int],
+    block_table: torch.Tensor,
+    active_block_indices: list | None,
+) -> torch.Tensor:
+    """[padded_batch_blocks, b_seqs] page IDs, block-slot major; padding gathers page 0."""
+    n = len(members)
+    block_ids_padded = torch.zeros(padded_batch_blocks, b_seqs, dtype=torch.int32)
+    bt = block_table[members].to(torch.int32)
+    if active_block_indices is None:
+        n_use_list = [min(nb, b_blocks) for nb in decode_blocks]
+        w = min(b_blocks, bt.shape[1])
+        cols = torch.arange(w)
+        in_range = cols.unsqueeze(0) < torch.tensor(n_use_list, dtype=torch.int64).unsqueeze(1)
+        block_ids_padded[:w, :n] = (bt[:, :w] * in_range).t()
+    else:
+        # Position i is the i-th ACTIVE block, matching the mask tiles.
+        for s, m in enumerate(members):
+            abs_blocks = active_block_indices[m]
+            n_use = min(len(abs_blocks), b_blocks)
+            for b, abs_b in enumerate(abs_blocks[:n_use]):
+                block_ids_padded[b, s] = bt[s, abs_b]
+    return block_ids_padded
 
 
 @dataclass
@@ -405,6 +459,14 @@ class SpyreAttentionMetadata(AttentionMetadata):
     mask_by_chunk_cpu: torch.Tensor | None = None
     mask_by_chunk_dev: torch.Tensor | None = None
     decode_groups: list[BatchedDecodeGroup] | None = None
+
+    # Device mirrors of host tensors, keyed by host object; update_block_table's copies
+    # share it, so block-table-independent tensors cross the link once per step.
+    mirror_cache: dict = field(default_factory=dict)
+
+    # What build() was called with, and the window of the builder that called it, so
+    # update_block_table can tell whether this metadata is valid for another builder.
+    built_for: "tuple[int | None, int, CommonAttentionMetadata] | None" = None
 
     # Which one it is *is* the path selection: one rectangle for the dense path, a list
     # of groups for the ragged one. Imported under TYPE_CHECKING only -- the encoder
@@ -973,12 +1035,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         # Sized per sequence, each its own allocation: a batch-max width becomes a
         # Dynamo guard the key cannot carry.
         num_active = [int(stack.shape[0]) for stack in attention_mask_stacks]
-        page_index_tables_cpu = []
-        for s, n in enumerate(num_active):
-            blocks_s = slice(n) if active_block_indices is None else active_block_indices[s]
-            table = torch.zeros(n, INT32_ELEMS_PER_STICK, dtype=torch.int32)
-            table[:, 0] = block_table[s, blocks_s]
-            page_index_tables_cpu.append(table)
+        page_index_tables_cpu = _page_index_tables(block_table, num_active, active_block_indices)
 
         # Padded to match key/value by upstream once forward_includes_kv_cache_update is
         # False, so the traced write keeps one shape per bucket, not one per token count.
@@ -1072,6 +1129,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             chunk_page_ids_cpu=chunk_page_ids_cpu,
             mask_by_chunk_cpu=mask_by_chunk_cpu,
             decode_groups=decode_groups,
+            built_for=(self.sliding_window, self.num_kv_heads, common_attn_metadata),
         )
 
     def _batched_decode_tensors(
@@ -1099,24 +1157,17 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         # Entry order (j, s), block-slot major, matching chunk_page_ids and the mask.
         rep_row_ids_cpu = query_row_ids.repeat(blocks_per_chunk)
 
-        block_ids_padded = torch.zeros(padded_batch_blocks, b_seqs, dtype=torch.int32)
-        bt = block_table[members].to(torch.int32)
-        if active_block_indices is None:
-            n_use_list = [min(nb, b_blocks) for nb in decode_blocks]
-            w = min(b_blocks, bt.shape[1])
-            cols = torch.arange(w)
-            in_range = cols.unsqueeze(0) < torch.tensor(n_use_list, dtype=torch.int64).unsqueeze(1)
-            block_ids_padded[:w, :n] = (bt[:, :w] * in_range).t()
-        else:
-            # Position i is the i-th ACTIVE block, matching the mask tiles.
-            for s, m in enumerate(members):
-                abs_blocks = active_block_indices[m]
-                n_use = min(len(abs_blocks), b_blocks)
-                for b, abs_b in enumerate(abs_blocks[:n_use]):
-                    block_ids_padded[b, s] = bt[s, abs_b]
         # Kept whole at offset 0: both walks narrow the block axis in-graph, so
         # this is one transfer per step rather than one per chunk.
-        chunk_page_ids_cpu = block_ids_padded
+        chunk_page_ids_cpu = _chunk_page_ids(
+            members,
+            b_seqs,
+            b_blocks,
+            padded_batch_blocks,
+            decode_blocks,
+            block_table,
+            active_block_indices,
+        )
 
         # -inf on padded rows/blocks and past-kv-len positions; 0 on
         # valid positions. The kernel broadcasts the mask to KV heads.
@@ -1219,6 +1270,105 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
     def publish_slot_mapping(self, slot_mapping: torch.Tensor) -> None:
         """Set the KV-write slots this builder's layers read on their next forward."""
         self._slot_mapping.publish(slot_mapping)
+
+    # Groups with equal specs differ only in block table and slot mapping, so vLLM hands
+    # each later group the first group's metadata to rebind instead of calling build().
+    supports_update_block_table: bool = True
+
+    def update_block_table(
+        self,
+        metadata: SpyreAttentionMetadata,
+        blk_table: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> SpyreAttentionMetadata:
+        """``metadata`` rebound to another group's block table; only page IDs are rebuilt,
+        masks and row tables (and their device mirrors) are shared."""
+        if self._encoder_only:
+            self.publish_slot_mapping(slot_mapping)
+            return replace(metadata, block_table=blk_table, slot_mapping=slot_mapping)
+        assert metadata.built_for is not None
+        window, num_kv_heads, common = metadata.built_for
+        if (window, num_kv_heads) != (self.sliding_window, self.num_kv_heads):
+            # A group split by window shares one cached metadata across builders whose
+            # masks differ, so a different window means a fresh build.
+            return self.build(
+                0, replace(common, block_table_tensor=blk_table, slot_mapping=slot_mapping)
+            )
+        self.publish_slot_mapping(slot_mapping)
+        assert metadata.attention_mask_stacks is not None
+        num_active = [int(stack.shape[0]) for stack in metadata.attention_mask_stacks]
+        active = metadata.active_block_indices
+        chunk_page_ids_cpu = None
+        if metadata.padded_num_seqs is not None:
+            assert metadata.padded_batch_blocks is not None
+            blocks_per_seq = (
+                num_active
+                if active is not None
+                else [
+                    (int(n) + self.block_size - 1) // self.block_size
+                    for n in metadata.seq_lens.tolist()
+                ]
+            )
+            n = metadata.num_decode_seqs
+            b_blocks = self._attn_bucketer.find_batched_blocks_bucket(
+                max(blocks_per_seq[:n]), metadata.padded_num_seqs
+            )
+            assert b_blocks is not None
+            chunk_page_ids_cpu = _chunk_page_ids(
+                list(range(n)),
+                metadata.padded_num_seqs,
+                b_blocks,
+                metadata.padded_batch_blocks,
+                blocks_per_seq[:n],
+                blk_table,
+                active,
+            )
+        decode_groups = None
+        if metadata.decode_groups is not None:
+            decode_groups = []
+            for g in metadata.decode_groups:
+                members = g.rows_cpu.tolist()
+                blocks_per_seq = (
+                    num_active
+                    if active is not None
+                    else [
+                        (int(n) + self.block_size - 1) // self.block_size
+                        for n in metadata.seq_lens.tolist()
+                    ]
+                )
+                dblocks = [blocks_per_seq[m] for m in members]
+                b_blocks = self._attn_bucketer.find_blocks_bucket(max(dblocks))
+                assert b_blocks is not None
+                decode_groups.append(
+                    replace(
+                        g,
+                        chunk_page_ids_cpu=_chunk_page_ids(
+                            members,
+                            g.padded_num_seqs,
+                            b_blocks,
+                            g.padded_batch_blocks,
+                            dblocks,
+                            blk_table,
+                            active,
+                        ),
+                        rows_dev=None,
+                        metadata=None,
+                    )
+                )
+        return replace(
+            metadata,
+            block_table=blk_table,
+            slot_mapping=slot_mapping,
+            page_index_tables_cpu=_page_index_tables(blk_table, num_active, active),
+            kernel_index_tables=None,
+            query_row_tables=None,
+            attention_mask_stacks_device=None,
+            rep_row_ids_dev=None,
+            chunk_page_ids_cpu=chunk_page_ids_cpu,
+            chunk_page_ids_dev=None,
+            mask_by_chunk_dev=None,
+            decode_groups=decode_groups,
+        )
 
     def build_for_variant(
         self, bucket: SpyreAttnBucket, causal: bool = True
@@ -2151,13 +2301,16 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         assert attn_metadata.rep_row_ids_cpu is not None
         assert attn_metadata.chunk_page_ids_cpu is not None
         assert attn_metadata.mask_by_chunk_cpu is not None
-        attn_metadata.rep_row_ids_dev = convert(attn_metadata.rep_row_ids_cpu, device=device)
+        rep_cpu, mask_cpu = attn_metadata.rep_row_ids_cpu, attn_metadata.mask_by_chunk_cpu
+        attn_metadata.rep_row_ids_dev = _mirror_once(
+            attn_metadata, rep_cpu, lambda: convert(rep_cpu, device=device)
+        )
         if not tile_loop.USE_FOR_EACH_TILE:
             attn_metadata.chunk_page_ids_dev = convert(
                 attn_metadata.chunk_page_ids_cpu, device=device
             )
-            attn_metadata.mask_by_chunk_dev = convert(
-                attn_metadata.mask_by_chunk_cpu, device=device
+            attn_metadata.mask_by_chunk_dev = _mirror_once(
+                attn_metadata, mask_cpu, lambda: convert(mask_cpu, device=device)
             )
             return
         # TEMPORARY until torch-spyre#4603 is validated: each page ID gets its own
@@ -2176,11 +2329,10 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         attn_metadata.chunk_page_ids_dev = idx.to(  # ty: ignore[no-matching-overload]
             device, device_layout=temporary_chunk_major_page_index_layout(c, e)
         )
-        attn_metadata.mask_by_chunk_dev = convert(
-            attn_metadata.mask_by_chunk_cpu.reshape(
-                c, bpc, b, *attn_metadata.mask_by_chunk_cpu.shape[2:]
-            ),
-            device=device,
+        attn_metadata.mask_by_chunk_dev = _mirror_once(
+            attn_metadata,
+            mask_cpu,
+            lambda: convert(mask_cpu.reshape(c, bpc, b, *mask_cpu.shape[2:]), device=device),
         )
 
     def _run_batched_decode(
@@ -2434,8 +2586,10 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 assert index_table.shape[0] == len(active_bs)
 
             if attn_metadata.query_row_tables is None:
-                attn_metadata.query_row_tables = _build_query_row_tables(
-                    attn_metadata, _target_device
+                attn_metadata.query_row_tables = _mirror_once(
+                    attn_metadata,
+                    attn_metadata.aligned_query_lens,
+                    lambda: _build_query_row_tables(attn_metadata, _target_device),
                 )
             row_table = attn_metadata.query_row_tables[seq_idx]
 
