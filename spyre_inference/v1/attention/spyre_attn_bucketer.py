@@ -255,8 +255,8 @@ class SpyreAttnBucketer:
     returns None, and the caller falls back to compiling on demand.
     """
 
-    def __init__(self, vllm_config: VllmConfig) -> None:
-        block_size = vllm_config.cache_config.block_size
+    def __init__(self, vllm_config: VllmConfig, block_size: int | None = None) -> None:
+        block_size = block_size or vllm_config.cache_config.block_size
         self.block_size = block_size
         max_model_len = vllm_config.model_config.max_model_len
         max_batched = vllm_config.scheduler_config.max_num_batched_tokens

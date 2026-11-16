@@ -87,6 +87,26 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+
+def kernel_block_size(cache_block_size: int, sliding_window: int | None) -> int:
+    """Tokens per page the attention kernel reads for a layer.
+
+    The block manager hands out ``cache_block_size`` blocks for every layer. A
+    sliding-window layer may read and store them as ``cache_block_size // n`` token
+    pages instead (SPYRE_SWA_KERNEL_BLOCK_SIZE): its block ``b`` is pages
+    ``b * n .. b * n + n - 1``, so a slot index means the same token in both.
+    """
+    swa_block_size = envs.SPYRE_SWA_KERNEL_BLOCK_SIZE
+    if sliding_window is None or swa_block_size is None:
+        return cache_block_size
+    if swa_block_size % 64 or cache_block_size % swa_block_size:
+        raise ValueError(
+            f"SPYRE_SWA_KERNEL_BLOCK_SIZE={swa_block_size} must be a multiple of 64 that "
+            f"divides block_size={cache_block_size}."
+        )
+    return swa_block_size
+
+
 # When set, wraps forward(), _online_softmax_attention() and the batched
 # decode K/V/mask gather blocks in torch.profiler.record_function spans for
 # kineto trace capture. Off by default: the spans are not free, so a profiled
@@ -431,14 +451,10 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         device: torch.device,
     ):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
-        # The attn_bucketer below derives its buckets from cache_config's block
-        # size, so a disagreement here would miss the recorded set.
         assert kv_cache_spec.block_size == vllm_config.cache_config.block_size, (
             f"kv cache spec block_size={kv_cache_spec.block_size} disagrees with "
-            f"cache_config.block_size={vllm_config.cache_config.block_size}; the "
-            "attention padding buckets are derived from the latter."
+            f"cache_config.block_size={vllm_config.cache_config.block_size}."
         )
-        self.block_size = kv_cache_spec.block_size
         self.head_size = kv_cache_spec.head_size
         # No KV cache, so build() skips every block-, page- and tile-shaped field.
         self._encoder_only = isinstance(kv_cache_spec, EncoderOnlyAttentionSpec)
@@ -452,6 +468,9 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         self.causal_override: bool | None = None
         if self.sliding_window is not None and self.sliding_window <= 0:
             raise ValueError(f"sliding_window must be positive, got {self.sliding_window}")
+        # The page size the kernels read, which the block table is re-expressed in.
+        self.block_size = kernel_block_size(kv_cache_spec.block_size, self.sliding_window)
+        self._pages_per_block = kv_cache_spec.block_size // self.block_size
 
         # Validate block_size alignment: Spyre stick size is 128 bytes (64 fp16 elements).
         # block_size must be a multiple of 64 to avoid restickification errors during
@@ -490,7 +509,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
 
         # record_graphs() enumerates this same instance, so the buckets warmup
         # compiles are exactly the ones build() can round onto.
-        self._attn_bucketer = SpyreAttnBucketer(vllm_config)
+        self._attn_bucketer = SpyreAttnBucketer(vllm_config, self.block_size)
 
         self._init_reorder_batch_threshold(
             reorder_batch_threshold=1 if envs.SPYRE_BATCHED_DECODE else None
@@ -785,6 +804,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
         per_seq_only: bool = False,
+        block_table_in_pages: bool = False,
     ) -> SpyreAttentionMetadata:
         """Build attention metadata from common metadata."""
 
@@ -793,6 +813,11 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         max_seq_len = common_attn_metadata.max_seq_len
         max_query_len = common_attn_metadata.max_query_len
         block_table = common_attn_metadata.block_table_tensor
+        if self._pages_per_block > 1 and not block_table_in_pages:
+            # Block b is pages b * n .. b * n + n - 1 (see kernel_block_size).
+            n = self._pages_per_block
+            pages = torch.arange(n, dtype=block_table.dtype, device=block_table.device)
+            block_table = (block_table.unsqueeze(-1) * n + pages).flatten(1)
         slot_mapping = common_attn_metadata.slot_mapping
         causal = common_attn_metadata.causal
         if isinstance(causal, torch.Tensor):
@@ -1248,6 +1273,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 causal=causal,
             ),
             per_seq_only=True,
+            block_table_in_pages=True,
         )
 
     def build_for_batched_decode_variant(
@@ -1281,6 +1307,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 causal=True,
                 is_prefilling=torch.zeros(num_seqs, dtype=torch.bool),
             ),
+            block_table_in_pages=True,
         )
         assert metadata.padded_num_seqs is not None, (
             f"build() declined the batched path for {bucket}; the recorded variant would "
@@ -1454,7 +1481,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         self.logits_soft_cap: float = 0.0 if logits_soft_cap is None else float(logits_soft_cap)
 
         # At construction: forward() runs past a custom-op boundary that loses the config.
-        self.block_size: int = get_current_vllm_config().cache_config.block_size
+        self.block_size: int = kernel_block_size(
+            get_current_vllm_config().cache_config.block_size, sliding_window
+        )
 
         # Always compiled: eager index_copy_ rejects an int32 index and falls
         # back to CPU with an int64 one.

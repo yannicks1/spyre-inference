@@ -125,7 +125,12 @@ def allocate_spyre_kv_caches(
             # stubs) gets the default decoder layout.
             impl = getattr(static_ctx.get(layer_name), "impl", None)
             impl_cls = type(impl) if isinstance(impl, SpyreAttentionImpl) else SpyreAttentionImpl
-            kv_caches[layer_name] = impl_cls.allocate_pages(num_blocks, spec, device)
+            # Same bytes per block: a layer reading smaller pages holds more of them.
+            page_tokens = getattr(impl, "block_size", spec.block_size)
+            pages_per_block = spec.block_size // page_tokens
+            kv_caches[layer_name] = impl_cls.allocate_pages(
+                num_blocks * pages_per_block, replace(spec, block_size=page_tokens), device
+            )
 
     for layer_name, target in shared_layers.items():
         kv_caches[layer_name] = kv_caches[target]

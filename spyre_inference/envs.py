@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     SPYRE_ATTN_FOR_EACH_TILE: bool = True
     SPYRE_ATTN_KV_BUCKETS: str | None = None
     SPYRE_ATTN_KV_LADDER: str = "pow2"
+    SPYRE_SWA_KERNEL_BLOCK_SIZE: int | None = None
     SPYRE_ATTN_KV_LADDER_LARGE_BATCH: str | None = None
     SPYRE_ATTN_LARGE_BATCH_MIN_SEQS: int = 16
     SPYRE_ATTN_QUERY_BUCKETS: str | None = None
@@ -94,6 +95,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SPYRE_ATTN_FOR_EACH_TILE": lambda: bool(int(os.getenv("SPYRE_ATTN_FOR_EACH_TILE", "1"))),
     # Comma-separated kv_len buckets to record, unset uses the SPYRE_ATTN_KV_LADDER preset.
     "SPYRE_ATTN_KV_BUCKETS": lambda: os.getenv("SPYRE_ATTN_KV_BUCKETS"),
+    # Sliding-window layers read the KV cache in pages of this many tokens, a divisor of
+    # block_size; unset reads every layer at block_size.
+    "SPYRE_SWA_KERNEL_BLOCK_SIZE": lambda: (
+        int(v) if (v := os.getenv("SPYRE_SWA_KERNEL_BLOCK_SIZE")) else None
+    ),
     # Named KV bucket ladder: pow2 (default), 8_5, 4_3, 9_8 or uniform.
     "SPYRE_ATTN_KV_LADDER": lambda: os.getenv("SPYRE_ATTN_KV_LADDER") or "pow2",
     # A denser preset for batched decode at SPYRE_ATTN_LARGE_BATCH_MIN_SEQS sequences or
