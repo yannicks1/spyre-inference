@@ -31,7 +31,7 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionImpl,
     SpyrePagedKVCache,
 )
-from spyre_inference.v1.core.kv_cache_config_builder import layer_spec
+from spyre_inference.v1.core.kv_cache_config_builder import layer_spec, page_bytes
 
 logger = init_logger(__name__)
 
@@ -124,8 +124,14 @@ def allocate_spyre_kv_caches(
             kv_cache_config.num_blocks, spec_by_layer[layer_names[0]], device
         )
 
+    # Largest pages first: TorchSpyreWorker._region_safe_blocks sized the cache for that order.
+    kv_cache_tensors = sorted(
+        kv_cache_config.kv_cache_tensors,
+        key=lambda t: page_bytes(spec_by_layer[t.layers[0]]),
+        reverse=True,
+    )
     kv_caches: dict[str, SpyrePagedKVCache] = {}
-    for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
+    for kv_cache_tensor in kv_cache_tensors:
         if kv_cache_tensor.layer_stride == 0:
             pages = allocate(kv_cache_tensor.layers)
             kv_caches.update(dict.fromkeys(kv_cache_tensor.layers, pages))

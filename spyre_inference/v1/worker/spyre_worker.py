@@ -14,8 +14,10 @@
 
 """A Torch Spyre worker class."""
 
+import gc
 import logging
 import os
+from collections import Counter, defaultdict
 from contextlib import AbstractContextManager, nullcontext
 
 import torch
@@ -53,6 +55,72 @@ logger = init_logger(__name__)
 # flex's MAX_REGION_SIZE: the allocator splits device memory into regions of this size
 # (six on a 96 GiB card), and never splits a tensor across two.
 _SPYRE_REGION_BYTES = 16 << 30
+# Room kept in every free extent for small allocations made between the sizing and the
+# KV cache allocation.
+_SPYRE_EXTENT_RESERVE_BYTES = 64 << 20
+
+
+def _spyre_allocations() -> dict[int, dict[int, int]]:
+    """``{region id: {offset: bytes}}`` of the storage behind every live Spyre tensor."""
+    from torch_spyre._C import get_composite_address
+
+    regions: dict[int, dict[int, int]] = defaultdict(dict)
+    for obj in gc.get_objects():
+        if not isinstance(obj, torch.Tensor) or obj.device.type != "spyre":
+            continue
+        try:
+            chunks = get_composite_address(obj).chunks()
+        except RuntimeError:
+            # No device storage behind it (a fake or empty tensor).
+            continue
+        for chunk in chunks:
+            blocks = regions[chunk.region_id]
+            blocks[chunk.offset] = max(blocks.get(chunk.offset, 0), chunk.size)
+    return regions
+
+
+def _free_extents(free: int, total: int) -> list[int] | None:
+    """Free byte ranges of the allocator's regions, each less the reserve; None when live
+    tensors do not account for every used byte, which could then split any range."""
+    num_regions = cdiv(total, _SPYRE_REGION_BYTES)
+    region_bytes = total // num_regions
+    extents = []
+    used = 0
+    allocations = _spyre_allocations()
+    for blocks in allocations.values():
+        # Merged, as an alias's storage may lie inside another allocation.
+        end = 0
+        for offset in sorted(blocks):
+            if offset > end:
+                extents.append(offset - end)
+            used += max(0, offset + blocks[offset] - max(offset, end))
+            end = max(end, offset + blocks[offset])
+        extents.append(region_bytes - end)
+    if used != total - free:
+        return None
+    extents += [region_bytes] * (num_regions - len(allocations))
+    return [e - _SPYRE_EXTENT_RESERVE_BYTES for e in extents if e > _SPYRE_EXTENT_RESERVE_BYTES]
+
+
+def _tensors_fit(tensor_bytes: list[int], extents: list[int]) -> bool:
+    """Whether the tensors, allocated largest first, fit whichever fitting extent the
+    allocator picks for each.
+
+    A tensor takes at most one of the ``extent // size`` slots of a size it does not
+    exceed, and at most ``ceil(larger / size)`` of them if larger.
+    """
+    counts = Counter(tensor_bytes)
+    sizes = sorted(counts, reverse=True)
+
+    def slots_left(k: int) -> int:
+        size = sizes[k]
+        taken = sum(counts[larger] * cdiv(larger, size) for larger in sizes[:k])
+        return sum(extent // size for extent in extents) - taken
+
+    return all(
+        any(slots_left(k) >= sum(counts[s] for s in sizes[k : j + 1]) for k in range(j + 1))
+        for j in range(len(sizes))
+    )
 
 
 def _kv_block_layout(
@@ -241,7 +309,7 @@ class TorchSpyreWorker(Worker):
         pool_bytes, tensor_bytes, per_request = layout
         blocks = available // sum(tensor_bytes)
         if not self.cache_config.kv_cache_memory_bytes:
-            blocks = min(blocks, self._region_safe_blocks(tensor_bytes))
+            blocks = self._region_safe_blocks(tensor_bytes, blocks)
         batch_blocks = self.scheduler_config.max_num_seqs * per_request + 1
         # Upstream replaces the measured count with the override in get_kv_cache_configs.
         override = self.cache_config.num_gpu_blocks_override
@@ -259,20 +327,31 @@ class TorchSpyreWorker(Worker):
             )
         return blocks * pool_bytes
 
-    def _region_safe_blocks(self, tensor_bytes: list[int]) -> int:
-        """The most blocks whose KV tensors fit the allocator's regions, wherever the
-        weights sit in them.
+    def _region_safe_blocks(self, tensor_bytes: list[int], max_blocks: int) -> int:
+        """The most blocks, up to max_blocks, whose KV tensors fit the allocator's regions.
 
-        A tensor fails only once every region has less room than it, so it is placed
-        while the free bytes left reach num_regions times its size; one largest tensor
-        spared per other region guarantees that for the last. A deep model's many small
-        tensors stay within the budget anyway; a shallow one's few large ones do not:
-        four layers at an 86 GiB budget make eight 10.75 GiB tensors, one per region, of
-        which six fit.
+        A shallow model's few large tensors may not fit its budget. Fewer blocks always fit
+        too, so the TP ranks' minimum is safe.
         """
         free, total = torch.accelerator.get_memory_info(self.init_snapshot.device_)
-        num_regions = cdiv(total, _SPYRE_REGION_BYTES)
-        return free // (sum(tensor_bytes) + (num_regions - 1) * max(tensor_bytes))
+        extents = _free_extents(free, total)
+        if extents is None:
+            logger.info(
+                "Live Spyre tensors do not account for the device memory in use; sizing the "
+                "KV cache for any placement of it."
+            )
+            # Spare one largest tensor per other region, wherever the used bytes sit.
+            num_regions = cdiv(total, _SPYRE_REGION_BYTES)
+            spared = (num_regions - 1) * max(tensor_bytes)
+            return min(max_blocks, free // (sum(tensor_bytes) + spared))
+        low, high = 0, max_blocks
+        while low < high:
+            mid = (low + high + 1) // 2
+            if _tensors_fit([n * mid for n in tensor_bytes], extents):
+                low = mid
+            else:
+                high = mid - 1
+        return low
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
         # FIXME: Work around for https://github.com/torch-spyre/torch-spyre/issues/1420

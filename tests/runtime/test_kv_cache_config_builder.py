@@ -130,3 +130,22 @@ def test_layers_of_one_tensor_are_bound_to_the_same_pages(monkeypatch):
     for tensor in config.kv_cache_tensors:
         assert len({id(caches[name]) for name in tensor.layers}) == 1
     assert len({id(c) for c in caches.values()}) == 4
+
+
+def test_larger_pages_are_allocated_first(monkeypatch):
+    """TorchSpyreWorker._region_safe_blocks sizes the cache for this order."""
+    swa, full = _swa(8, 256, 1024), _full(2, 512)
+    config, _ = _plan(_five_to_one(30, swa, full))
+    calls = []
+
+    def _fake_allocate_pages(cls, blocks, spec, device):
+        calls.append(spec.page_size_bytes)
+        return object()
+
+    monkeypatch.setattr(
+        spyre_attn_mod.SpyreAttentionImpl, "allocate_pages", classmethod(_fake_allocate_pages)
+    )
+
+    allocate_spyre_kv_caches(config, {}, {}, torch.device("cpu"))
+
+    assert calls == [swa.page_size_bytes] * 5 + [full.page_size_bytes] * 5

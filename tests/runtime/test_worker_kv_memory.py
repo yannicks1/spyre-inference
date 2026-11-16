@@ -14,11 +14,15 @@
 
 """TorchSpyreWorker sizes the KV cache through upstream's Worker.determine_available_memory
 (spyre-inference#901), with every block the measured memory pays for. Only the card is
-faked: torch.accelerator's memory view, with free bytes the test sets.
+faked: torch.accelerator's memory view, with free bytes the test sets, and the live
+allocations in the allocator's regions.
 
 The device cost per block is that of every tensor SpyreKVCacheConfigBuilder places."""
 
+import itertools
 import logging
+import random
+from collections.abc import Callable
 from types import SimpleNamespace
 
 import pytest
@@ -29,12 +33,15 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec, SlidingWind
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.utils import request_memory
 
-from spyre_inference.v1.worker import spyre_model_runner
+from spyre_inference.v1.worker import spyre_model_runner, spyre_worker
 from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
-from spyre_inference.v1.worker.spyre_worker import TorchSpyreWorker
+from spyre_inference.v1.worker.spyre_worker import TorchSpyreWorker, _tensors_fit
 
 GiB = 1 << 30
+MiB = 1 << 20
 TOTAL = 96 * GiB
+REGION = 16 * GiB
+RESERVE = spyre_worker._SPYRE_EXTENT_RESERVE_BYTES
 BLOCK_BYTES = 2 * 2 * 4 * 128 * 128  # K+V, fp16, 4 kv heads, head 128, block 128
 BATCH_BLOCKS = 4 * (1024 // 128) + 1  # _worker's default max_num_seqs at max_model_len
 NUM_LAYERS = 32
@@ -58,10 +65,17 @@ def _worker(
     dtype: torch.dtype = torch.float16,
     kv_cache_spec: dict | None = None,
     hybrid_kv_cache_manager: bool = False,
+    allocations: dict | None = None,
 ) -> TorchSpyreWorker:
-    """A worker that started on an empty card and whose model now leaves free_after_load."""
-    card = SimpleNamespace(free=TOTAL)
+    """A worker that started on an empty card and whose model now leaves free_after_load.
+
+    The model's bytes sit at the start of each of the six regions, spread evenly as the
+    allocator spreads them, unless ``allocations`` (``{region: {offset: bytes}}``) says
+    where they are.
+    """
+    card = SimpleNamespace(free=TOTAL, allocations={})
     monkeypatch.setattr(torch.accelerator, "get_memory_info", lambda *_: (card.free, TOTAL))
+    monkeypatch.setattr(spyre_worker, "_spyre_allocations", lambda: card.allocations)
     monkeypatch.setattr(torch.accelerator, "memory_stats", lambda *_: {})
     monkeypatch.setattr(torch.accelerator, "memory_reserved", lambda *_: 0)
     monkeypatch.setattr(torch.accelerator, "reset_peak_memory_stats", lambda *_: None)
@@ -91,6 +105,12 @@ def _worker(
     worker.init_snapshot = MemorySnapshot(device=torch.device("cpu"))
     worker.requested_memory = request_memory(worker.init_snapshot, worker.cache_config)
     card.free = free_after_load
+    used = TOTAL - free_after_load
+    card.allocations = (
+        allocations
+        if allocations is not None
+        else {r: {0: used // 6} for r in range(6) if used > 0}
+    )
     return worker
 
 
@@ -130,33 +150,157 @@ def test_an_fp8_cache_fits_twice_the_blocks(monkeypatch):
     assert blocks[torch.uint8] == 2 * blocks[torch.float16]
 
 
-def _pack(tensor_bytes: list[int], free_regions: list[int]) -> bool:
-    """Place each tensor in the region with the most room, as the allocator does."""
+def _pack(
+    tensor_bytes: list[int],
+    allocations: dict,
+    choose: Callable[[list[list[int]]], list[int]] | None = None,
+) -> bool:
+    """Place each tensor, largest first, as the allocator does: among the regions whose
+    free bytes cover it (the most free first, or ``choose``'s pick), the first whose
+    smallest fitting free range holds it."""
+    regions: list[list[int]] = []
+    for r in range(6):
+        blocks = sorted(allocations.get(r, {}).items())
+        gaps: list[int] = []
+        end = 0
+        for offset, size in blocks:
+            gaps.append(offset - end)
+            end = offset + size
+        regions.append([*gaps, REGION - end])
     for nbytes in sorted(tensor_bytes, reverse=True):
-        i = max(range(len(free_regions)), key=free_regions.__getitem__)
-        if free_regions[i] < nbytes:
+        candidates = [g for g in regions if sum(g) >= nbytes and max(g) >= nbytes]
+        if not candidates:
             return False
-        free_regions[i] -= nbytes
+        region = choose(candidates) if choose else max(candidates, key=lambda g: sum(g))
+        i = min((i for i, g in enumerate(region) if g >= nbytes), key=region.__getitem__)
+        region[i] -= nbytes
     return True
 
 
-@pytest.mark.parametrize("weights_region", [0, 5])
-def test_a_shallow_models_kv_tensors_fit_the_16_gib_regions(monkeypatch, weights_region):
-    """A tensor never spans two of the card's six 16 GiB regions. Four layers at the
-    default budget would make eight 10.75 GiB K/V tensors, of which only six fit."""
+def _shallow_worker(monkeypatch, allocations: dict) -> TorchSpyreWorker:
+    """Four layers, so the default budget would make eight K/V tensors over half a region."""
+    used = sum(sum(blocks.values()) for blocks in allocations.values())
     worker = _worker(
-        monkeypatch, free_after_load=95 * GiB, kv_cache_spec=_full_layers(num_layers=4)
+        monkeypatch,
+        free_after_load=TOTAL - used,
+        kv_cache_spec=_full_layers(num_layers=4),
+        allocations=allocations,
     )
     worker.cache_config.gpu_memory_utilization = 0.92
     worker.requested_memory = request_memory(worker.init_snapshot, worker.cache_config)
-    region = 16 * GiB
-    regions = [region] * 6
-    regions[weights_region] -= 1 * GiB
+    return worker
+
+
+@pytest.mark.parametrize(
+    "allocations",
+    [
+        pytest.param({0: {0: 1 * GiB}}, id="weights-in-one-region"),
+        pytest.param({5: {0: 1 * GiB}}, id="weights-in-the-last-region"),
+        pytest.param({r: {0: 400 * MiB} for r in range(6)}, id="weights-spread"),
+    ],
+)
+def test_a_shallow_models_kv_tensors_fill_the_16_gib_regions(monkeypatch, allocations):
+    """A tensor never spans two of the card's regions, so at the full budget one tensor
+    fits each. Two per region fit at just under half a region each."""
+    worker = _shallow_worker(monkeypatch, allocations)
+    weights = sum(sum(blocks.values()) for blocks in allocations.values())
+    extents = sorted(
+        (REGION - sum(allocations.get(r, {}).values()) - RESERVE for r in range(6)), reverse=True
+    )
 
     blocks = worker.determine_available_memory() // (4 * BLOCK_BYTES)
 
-    assert blocks * 4 * BLOCK_BYTES < worker.requested_memory - 1 * GiB
-    assert _pack([blocks * BLOCK_BYTES // 2] * 8, regions)
+    assert blocks * 4 * BLOCK_BYTES < worker.requested_memory - weights
+    # Two to a region in the four roomiest, as large as the extent reserve allows.
+    assert blocks == extents[3] // 2 // (BLOCK_BYTES // 2)
+    assert _pack([blocks * BLOCK_BYTES // 2] * 8, allocations)
+
+
+def test_a_live_allocation_inside_a_region_splits_its_free_range(monkeypatch):
+    """A tensor needs one contiguous range: an allocation in the middle of every region
+    leaves two halves, each holding one tensor of just under half a region, not two."""
+    allocations = {r: {8 * GiB: 1 * MiB} for r in range(6)}
+    worker = _shallow_worker(monkeypatch, allocations)
+
+    blocks = worker.determine_available_memory() // (4 * BLOCK_BYTES)
+
+    assert blocks == (8 * GiB - 1 * MiB - RESERVE) // (BLOCK_BYTES // 2)
+    assert _pack([blocks * BLOCK_BYTES // 2] * 8, allocations)
+
+
+def test_bytes_no_live_tensor_holds_size_for_any_placement(monkeypatch):
+    """Bytes the walk cannot locate could split any free range, so the tensors are sized
+    as if every region held some: one largest tensor spared per other region."""
+    seen = {r: {0: 400 * MiB} for r in range(6)}
+    worker = _shallow_worker(monkeypatch, seen)
+    free = TOTAL - 2400 * MiB - 2 * GiB
+    monkeypatch.setattr(torch.accelerator, "get_memory_info", lambda *_: (free, TOTAL))
+
+    blocks = worker.determine_available_memory() // (4 * BLOCK_BYTES)
+
+    assert blocks == free // ((8 + 5) * (BLOCK_BYTES // 2))
+
+
+def test_an_alias_inside_an_allocation_is_not_counted_twice(monkeypatch):
+    """A view's storage may start inside another allocation (a per-expert alias of an
+    expert stack); the region's free range starts where the outer allocation ends."""
+    allocations = {0: {0: 4 * GiB, 1 * GiB: 512 * MiB}}
+    monkeypatch.setattr(spyre_worker, "_spyre_allocations", lambda: allocations)
+
+    extents = spyre_worker._free_extents(TOTAL - 4 * GiB, TOTAL)
+
+    assert extents is not None
+    assert sorted(extents) == [12 * GiB - RESERVE] + [REGION - RESERVE] * 5
+
+
+def _choices(tensor_bytes: list[int], allocations: dict):
+    """Every sequence of region choices the allocator could make."""
+    for picks in itertools.product(range(6), repeat=len(tensor_bytes)):
+        it = iter(picks)
+
+        def choose(candidates, it=it):
+            return candidates[next(it) % len(candidates)]
+
+        yield choose
+
+
+def test_mixed_sizes_fit_whichever_region_the_allocator_picks():
+    """_tensors_fit's bound is sound for every placement order among fitting regions."""
+    rng = random.Random(0)
+    checked = 0
+    for _ in range(120):
+        allocations = {r: {0: rng.randrange(0, 12) * GiB} for r in range(6) if rng.random() < 0.7}
+        allocations = {r: b for r, b in allocations.items() if b[0]}
+        sizes = rng.choice([[3, 4, 6, 8], [4, 4.25], [5, 5.5, 8]])
+        tensors = [int(rng.choice(sizes) * GiB) for _ in range(rng.randrange(2, 5))]
+        extents = [REGION - b[0] for b in allocations.values()]
+        extents += [REGION] * (6 - len(allocations))
+        if not _tensors_fit(tensors, extents):
+            continue
+        checked += 1
+        for choose in _choices(tensors, allocations):
+            assert _pack(tensors, allocations, choose), (tensors, allocations)
+    assert checked > 20
+
+
+def test_close_sizes_fit_rounded_up_to_the_larger():
+    """Placing a slightly larger tensor may take two slots of the smaller size, but
+    rounded up to the larger size every tensor takes one."""
+    extents = [3270 * MiB] * 6
+
+    assert _tensors_fit([1310 * MiB] * 6 + [1256 * MiB] * 2, extents)
+
+
+def test_equal_sizes_fit_exactly_as_the_bound_says():
+    """For one tensor size the bound is exact: one byte more and the allocator fails."""
+    allocations = {r: {0: 400 * MiB} for r in range(6)}
+    extents = [REGION - 400 * MiB] * 6
+    size = (REGION - 400 * MiB) // 2
+
+    assert _tensors_fit([size] * 12, extents)
+    assert _pack([size] * 12, allocations)
+    assert not _tensors_fit([size + 1] * 12, extents)
+    assert not _pack([size + 1] * 12, allocations)
 
 
 def _mamba_hybrid(num_mamba: int = 6) -> dict:

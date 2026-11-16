@@ -285,7 +285,8 @@ overlays on one buffer share one K and one V tensor per page shape instead. Mode
 layers all have one shape (Gemma-3) match upstream's footprint; Gemma-4's sliding-window
 and global layers differ in shape, so each block is backed once per shape, and every group
 keeps `--block-size`. The Spyre allocator never splits a tensor across its 16 GiB memory
-regions, so a model with few, large tensors gets fewer blocks than its budget.
+regions, so a model with few, large tensors gets the blocks whose tensors pack into the
+regions' free ranges after loading, which can be fewer than its budget.
 When memory runs out before a full batch fits, a warning names the knobs,
 and requests wait for pages instead of all running at full length.
 
