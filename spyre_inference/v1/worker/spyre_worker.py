@@ -32,9 +32,7 @@ from vllm.v1.core.kv_cache_planning import (
 )
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
-    KVCacheGroupSpec,
     KVCacheSpec,
-    UniformTypeKVCacheSpecs,
 )
 from vllm.v1.worker.gpu_worker import Worker, init_worker_distributed_environment
 from vllm.v1.worker.utils import request_memory
@@ -45,6 +43,7 @@ from spyre_inference.custom_ops import register_all
 from spyre_inference.models import register_models
 from spyre_inference.platform import _raise_dynamo_recompile_limits
 from spyre_inference.threading_config import apply_in_process_threading
+from spyre_inference.v1.core.kv_cache_config_builder import page_bytes, spyre_kv_placement
 from spyre_inference.v1.worker import compile_guard
 from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
 
@@ -62,12 +61,9 @@ def _kv_block_layout(
     """``(pool bytes per block, bytes per block of each Spyre KV tensor, blocks per full
     request)``, or None without a KV cache.
 
-    With ``disable_hybrid_kv_cache_manager`` every layer lands in one group and the pool
-    bytes match the tensors' sum. They differ for a Mamba hybrid, which keeps the hybrid
-    manager: upstream overlays its groups on one buffer and needs ``pool bytes`` per block, while
-    Spyre allocates every layer's own page per block, unpadded where upstream pads (a
-    Mamba state). The per-request count is upstream's grouping, so a Mamba group holds
-    one block and a sliding-window group its window.
+    The tensors are the builder's placement (``SpyreKVCacheConfigBuilder``): one K and one
+    V tensor per page shape in each slot upstream would overlay. The per-request count is
+    upstream's grouping, so a sliding-window group holds its window.
     """
     if not kv_cache_spec:
         return None
@@ -84,23 +80,13 @@ def _kv_block_layout(
     if not groups:
         return None
     pool_bytes = _pool_bytes_per_block_from_builder(builder, vllm_config, groups)
-    # Attention and Mamba specs pad their page to a shared size; Spyre's pages do not.
     tensors: list[int] = []
-    for group in groups:
-        for name in group.layer_names:
-            spec = _layer_spec(group, name)
-            page = getattr(spec, "real_page_size_bytes", spec.page_size_bytes)
-            # An attention page holds K and V, which allocate_pages allocates apart.
-            tensors += [page // 2] * 2 if isinstance(spec, AttentionSpec) else [page]
+    for spec, _ in spyre_kv_placement(groups):
+        page = page_bytes(spec)
+        # An attention page holds K and V, which allocate_pages allocates apart.
+        tensors += [page // 2] * 2 if isinstance(spec, AttentionSpec) else [page]
     per_request = _max_memory_usage_bytes_from_groups(builder, vllm_config, groups) // pool_bytes
     return pool_bytes, tensors, per_request
-
-
-def _layer_spec(group: KVCacheGroupSpec, layer_name: str) -> KVCacheSpec:
-    spec = group.kv_cache_spec
-    if isinstance(spec, UniformTypeKVCacheSpecs):
-        return spec.kv_cache_specs[layer_name]
-    return spec
 
 
 def _get_spyre_pcie_address(local_rank: int) -> str:
@@ -243,11 +229,10 @@ class TorchSpyreWorker(Worker):
         consumed; a forward's activations come out of the 1 - gpu_memory_utilization
         headroom.
 
-        Upstream turns the returned bytes into blocks by its pool's bytes per block,
-        while Spyre gives every layer its own page per block (``allocate_spyre_kv_caches``),
-        which costs more wherever groups would share a page. So the measured device bytes
-        are converted into blocks at Spyre's cost per block and handed back in upstream's
-        units.
+        Upstream turns the returned bytes into blocks by the builder's bytes per block,
+        the pages of every Spyre KV tensor (``SpyreKVCacheConfigBuilder``). The allocator
+        never splits a tensor across its regions, so the measured bytes are converted into
+        the blocks whose tensors still pack into them, and handed back in upstream's units.
         """
         available = super().determine_available_memory()
         layout = _kv_block_layout(self.vllm_config, self.model_runner.get_kv_cache_spec())

@@ -12,8 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Attention-group window split and per-layer KV page allocation, shared by both
-model runners."""
+"""Attention-group window split and KV page allocation, shared by both model runners."""
 
 from copy import copy
 from dataclasses import replace
@@ -32,6 +31,7 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionImpl,
     SpyrePagedKVCache,
 )
+from spyre_inference.v1.core.kv_cache_config_builder import layer_spec
 
 logger = init_logger(__name__)
 
@@ -101,31 +101,36 @@ def allocate_spyre_kv_caches(
     shared_layers: dict[str, str],
     device: torch.device,
 ) -> dict[str, SpyrePagedKVCache]:
-    """One SpyrePagedKVCache per layer, in the layout its attention impl allocates."""
-    # One spec per layer. disable_hybrid_kv_cache_manager (set in the platform)
-    # collapses hybrid models into a single group; when the layers' head shapes differ
-    # its spec is a UniformTypeKVCacheSpecs, which unwraps to the real per-layer specs
-    # so each layer keeps its own num_kv_heads/head_size. A merged spec is direct.
-    spec_by_layer = {}
-    for group in kv_cache_config.kv_cache_groups:
-        per_layer = getattr(group.kv_cache_spec, "kv_cache_specs", None)
-        if per_layer is not None:
-            spec_by_layer.update(per_layer)
-        else:
-            spec_by_layer.update({ln: group.kv_cache_spec for ln in group.layer_names})
+    """SpyrePagedKVCache pages per layer; the layers of a zero-stride KVCacheTensor share one."""
+    spec_by_layer = {
+        layer_name: layer_spec(group, layer_name)
+        for group in kv_cache_config.kv_cache_groups
+        for layer_name in group.layer_names
+    }
+
+    def allocate(layer_names: list[str]) -> SpyrePagedKVCache:
+        # The layout belongs to the backend; a layer without an impl (fixture stubs) gets
+        # the default decoder layout.
+        impl_classes = {
+            type(impl) if isinstance(impl, SpyreAttentionImpl) else SpyreAttentionImpl
+            for impl in (getattr(static_ctx.get(name), "impl", None) for name in layer_names)
+        }
+        if len(impl_classes) != 1:
+            raise ValueError(
+                f"Layers {layer_names} share one KV cache tensor but have attention impls "
+                f"{sorted(c.__name__ for c in impl_classes)}, whose page layouts may differ."
+            )
+        return impl_classes.pop().allocate_pages(
+            kv_cache_config.num_blocks, spec_by_layer[layer_names[0]], device
+        )
 
     kv_caches: dict[str, SpyrePagedKVCache] = {}
-    # A KVCacheTensor lists several layers; sharing one page buffer among them
-    # would let each layer's KV write clobber the others'.
-    num_blocks = kv_cache_config.num_blocks
     for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-        for layer_name in kv_cache_tensor.layers:
-            spec = spec_by_layer[layer_name]
-            # The layout belongs to the backend; a layer without an impl (fixture
-            # stubs) gets the default decoder layout.
-            impl = getattr(static_ctx.get(layer_name), "impl", None)
-            impl_cls = type(impl) if isinstance(impl, SpyreAttentionImpl) else SpyreAttentionImpl
-            kv_caches[layer_name] = impl_cls.allocate_pages(num_blocks, spec, device)
+        if kv_cache_tensor.layer_stride == 0:
+            pages = allocate(kv_cache_tensor.layers)
+            kv_caches.update(dict.fromkeys(kv_cache_tensor.layers, pages))
+        else:
+            kv_caches.update({name: allocate([name]) for name in kv_cache_tensor.layers})
 
     for layer_name, target in shared_layers.items():
         kv_caches[layer_name] = kv_caches[target]

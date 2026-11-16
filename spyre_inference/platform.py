@@ -480,6 +480,10 @@ class TorchSpyrePlatform(CpuPlatform):
         )
 
     @classmethod
+    def get_kv_cache_config_builder_cls(cls, vllm_config: VllmConfig) -> str:
+        return "spyre_inference.v1.core.kv_cache_config_builder.SpyreKVCacheConfigBuilder"
+
+    @classmethod
     def get_device_communicator_cls(cls) -> str:
         # The base `CpuPlatform` returns `CpuCommunicator`, which delegates
         # to gloo collectives. With `dist_backend = "cpu:gloo,spyre:spyreccl"`
@@ -981,12 +985,6 @@ class TorchSpyrePlatform(CpuPlatform):
         scheduler_class = "spyre_inference.v1.core.scheduler.TorchSpyreScheduler"
         logger.info("Loading scheduler from: %s", scheduler_class)
         scheduler_config.scheduler_cls = scheduler_class
-
-        # Spyre can't offset- or shape-re-view one on-device KV buffer per layer
-        # (torch-spyre#3770, "Unexpected stick expression"). Disabling the hybrid
-        # KV-cache manager gives every layer its own buffer; SWA is still computed, per
-        # layer, via `_split_attn_groups_by_layer_window`. No-op for non-hybrid models.
-        scheduler_config.disable_hybrid_kv_cache_manager = True
 
         # CpuPlatform would turn any value, 0 included, into --kv-cache-memory-bytes,
         # overriding the flag; a size would also skip the measurement and hand out a

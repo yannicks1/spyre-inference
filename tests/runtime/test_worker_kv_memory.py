@@ -16,8 +16,7 @@
 (spyre-inference#901), with every block the measured memory pays for. Only the card is
 faked: torch.accelerator's memory view, with free bytes the test sets.
 
-The device cost per block comes from upstream's own KV cache grouping, and every layer's
-own page counts towards it, as allocate_spyre_kv_caches allocates them."""
+The device cost per block is that of every tensor SpyreKVCacheConfigBuilder places."""
 
 import logging
 from types import SimpleNamespace
@@ -173,9 +172,7 @@ def _mamba_hybrid(num_mamba: int = 6) -> dict:
 
 
 def test_a_mamba_hybrid_is_sized_by_its_per_layer_device_cost(monkeypatch):
-    """vLLM's pool needs one shared page per block for all groups, but Spyre gives every
-    layer its own page: the budget converts the measured device bytes into blocks at
-    Spyre's cost, so they fit on the card."""
+    """Spyre gives every Mamba layer its own unpadded state, and the budget counts that cost."""
     specs = _mamba_hybrid()
     worker = _worker(
         monkeypatch, free_after_load=20 * GiB, kv_cache_spec=specs, hybrid_kv_cache_manager=True
@@ -183,11 +180,10 @@ def test_a_mamba_hybrid_is_sized_by_its_per_layer_device_cost(monkeypatch):
     mamba_bytes = specs["layers.0.mixer"].real_page_size_bytes
     spyre_bytes_per_block = 6 * mamba_bytes + BLOCK_BYTES
 
-    blocks = worker.determine_available_memory() // BLOCK_BYTES
+    blocks = worker.determine_available_memory() // spyre_bytes_per_block
 
     measured = worker.requested_memory - (TOTAL - 20 * GiB)
     assert blocks == measured // spyre_bytes_per_block
-    assert blocks * spyre_bytes_per_block <= measured
 
 
 @pytest.mark.parametrize(("spare_blocks", "warns"), [(-1, True), (0, False)])

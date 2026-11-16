@@ -1705,12 +1705,12 @@ class TorchSpyreModelRunner(GPUModelRunner):
         kernel_block_sizes,
         kv_cache_allocation_context: AbstractContextManager | None = None,
     ):
-        """Allocate KV cache as one dense paged tensor per layer on Spyre.
+        """Allocate KV cache as dense paged tensors on Spyre, one per KVCacheTensor.
 
-        Each layer gets its own SpyrePagedKVCache(k_pages, v_pages), in the shape and
-        device layout its attention impl's `allocate_pages` chooses. The attention kernel
-        selects a page by indexing with a one-element device tensor, so the page read is
-        a real indirect access.
+        Each KVCacheTensor gets one SpyrePagedKVCache(k_pages, v_pages), bound to every
+        layer it lists, in the shape and device layout its attention impl's `allocate_pages`
+        chooses. The attention kernel selects a page by indexing with a one-element device
+        tensor, so the page read is a real indirect access.
 
         ``kernel_block_sizes`` is ignored: the backend accepts any 64-multiple, so the
         kernel block size always equals the manager's.
