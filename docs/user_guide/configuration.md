@@ -282,9 +282,12 @@ need; with prefix caching on, the spare blocks keep earlier prompts' KV for reus
 vLLM's hybrid KV cache manager is on, so a sliding-window layer holds only the blocks of
 its window. A Spyre tensor cannot be viewed at another shape, so the layers upstream
 overlays on one buffer share one K and one V tensor per page shape instead. Models whose
-layers all have one shape (Gemma-3) match upstream's footprint; Gemma-4's sliding-window
-and global layers differ in shape, so each block is backed once per shape, and every group
-keeps `--block-size`. The Spyre allocator never splits a tensor across its 16 GiB memory
+layers all have one shape (Gemma-3) match upstream's footprint. Gemma-4's global layers
+keep upstream's larger block and store it in the sliding-window page shape (a 256-token
+block of two 512-wide heads fills one 128-token page of eight 256-wide heads), so they
+match it too; attention runs `--block-size`-token pages either way. Shapes that do not
+fold that way keep `--block-size` for every group and back each block once per shape.
+The Spyre allocator never splits a tensor across its 16 GiB memory
 regions, so a model with few, large tensors gets fewer blocks than its budget.
 When memory runs out before a full batch fits, a warning names the knobs,
 and requests wait for pages instead of all running at full length.

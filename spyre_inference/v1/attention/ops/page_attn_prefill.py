@@ -23,6 +23,7 @@ every query row, so this kernel spends it instead: batched GQA over
 import torch
 
 from spyre_inference.v1.attention.ops.sinks import normalize
+from spyre_inference.v1.attention.ops.split_heads import split_pv, split_scores
 from spyre_inference.v1.attention.ops.tile_loop import walk_tiles
 
 
@@ -45,6 +46,7 @@ def page_attn_prefill_kernel(
     v_scale=None,
     sinks=None,
     page_group=1,
+    head_split=1,
 ):
     """Online softmax attention over ``num_blocks`` pages of the unfolded cache.
 
@@ -58,6 +60,8 @@ def page_attn_prefill_kernel(
             folds k_scale into ``scale``.
         sinks: [num_kv_heads, num_queries_per_kv, 1] per-head sink logits, or None.
         page_group: pages per online-softmax update; must divide num_blocks.
+        head_split: page heads per KV head; the pages are ``head_size // head_split``
+            wide (see ``split_heads``).
     """
     if page_group < 1 or num_blocks % page_group:
         raise ValueError(
@@ -108,8 +112,17 @@ def page_attn_prefill_kernel(
         if k_page.dtype != q.dtype:
             k_page = k_page.to(q.dtype)
             v_page = v_page.to(q.dtype)
+        kv_axis = 1 if grouped else 0
 
-        scores = torch.matmul(q, k_page.transpose(-2, -1)) * scale
+        def pv(tile_probs):
+            if head_split == 1:
+                return torch.matmul(tile_probs, v_page)
+            return split_pv(tile_probs, v_page, head_split, kv_axis)
+
+        if head_split == 1:
+            scores = torch.matmul(q, k_page.transpose(-2, -1)) * scale
+        else:
+            scores = split_scores(q, k_page, head_split, kv_axis) * scale
         if logits_soft_cap > 0.0:
             # Before the mask add: tanh(-inf/cap)*cap is -cap, not -inf, so capping after it
             # would un-mask the padded lanes.
@@ -123,7 +136,7 @@ def page_attn_prefill_kernel(
             return (
                 scores_max,
                 fold_group(tile_probs.sum(dim=-1, keepdim=True), torch.sum),
-                fold_group(torch.matmul(tile_probs, v_page), torch.sum),
+                fold_group(pv(tile_probs), torch.sum),
             ), None
 
         tile_max, tile_sum, tile_output = carry
@@ -133,7 +146,7 @@ def page_attn_prefill_kernel(
         new_max = torch.maximum(tile_max, scores_max)
         tile_probs = torch.exp(scores - new_max)
         new_sum = tile_sum * rescale + fold_group(tile_probs.sum(dim=-1, keepdim=True), torch.sum)
-        new_output = tile_output * rescale + fold_group(torch.matmul(tile_probs, v_page), torch.sum)
+        new_output = tile_output * rescale + fold_group(pv(tile_probs), torch.sum)
         return (new_max, new_sum, new_output), None
 
     group_axis = (1,) if grouped else ()

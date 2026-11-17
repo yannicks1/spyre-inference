@@ -31,7 +31,7 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionImpl,
     SpyrePagedKVCache,
 )
-from spyre_inference.v1.core.kv_cache_config_builder import layer_spec
+from spyre_inference.v1.core.kv_cache_config_builder import layer_spec, page_fold
 
 logger = init_logger(__name__)
 
@@ -124,11 +124,28 @@ def allocate_spyre_kv_caches(
             kv_cache_config.num_blocks, spec_by_layer[layer_names[0]], device
         )
 
+    def bind_folded(layer_name: str, pages: SpyrePagedKVCache, page_spec) -> SpyrePagedKVCache:
+        """``pages`` as ``layer_name`` reads them: its blocks fold into the page shape."""
+        fold = page_fold(spec_by_layer[layer_name], page_spec)
+        if fold is None or fold == (1, 1):
+            return pages
+        token_split, head_split = fold
+        num_blocks, page_heads, block_size, page_head_size = pages.k_pages.shape
+        shape = (num_blocks * token_split, page_heads // token_split, block_size, page_head_size)
+        impl = getattr(static_ctx.get(layer_name), "impl", None)
+        if isinstance(impl, SpyreAttentionImpl):
+            impl.head_split = head_split
+        return SpyrePagedKVCache(pages.k_pages.view(shape), pages.v_pages.view(shape))
+
     kv_caches: dict[str, SpyrePagedKVCache] = {}
     for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
         if kv_cache_tensor.layer_stride == 0:
+            # spyre_kv_placement lists the page's own layers before the layers folded in.
+            page_spec = spec_by_layer[kv_cache_tensor.layers[0]]
             pages = allocate(kv_cache_tensor.layers)
-            kv_caches.update(dict.fromkeys(kv_cache_tensor.layers, pages))
+            kv_caches.update(
+                (name, bind_folded(name, pages, page_spec)) for name in kv_cache_tensor.layers
+            )
         else:
             kv_caches.update({name: allocate([name]) for name in kv_cache_tensor.layers})
 

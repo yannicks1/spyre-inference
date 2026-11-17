@@ -32,8 +32,8 @@ def quantize_kv(x, scale, dtype):
 def reshape_and_cache_kernel(key, value, k_rows, v_rows, row_index, *, k_scale=None, v_scale=None):
     """Store one head at a time: head-major puts a token's heads block_size rows apart.
 
-    k/v_rows are [num_blocks * num_kv_heads * block_size, head_size] views; row_index is
-    one [T] int64 tensor per KV head. A single index over a flattened (T, KV) source does
+    k/v_rows are [num_pages * page_heads * block_size, page_head_size] views; row_index is
+    one [T] int64 tensor per page head. A single index over a flattened (T, KV) source does
     not compile (UnalignedStickSplit on the merged row axis). With k/v_scale the rows are
     float8.
     """
@@ -47,6 +47,15 @@ def reshape_and_cache_kernel(key, value, k_rows, v_rows, row_index, *, k_scale=N
     else:
         key = quantize_kv(key, k_scale, k_rows.dtype)
         value = quantize_kv(value, v_scale, v_rows.dtype)
-    for h, idx in enumerate(row_index):
-        k_rows.index_copy_(0, idx, key[:, h])
-        v_rows.index_copy_(0, idx, value[:, h])
+    # Page head e * num_kv_heads + h holds part e of head h (see ``split_heads``).
+    num_kv_heads = key.shape[1]
+    head_split = len(row_index) // num_kv_heads
+    d = k_rows.shape[-1]
+    for j, idx in enumerate(row_index):
+        e, h = divmod(j, num_kv_heads)
+        if head_split == 1:
+            k_rows.index_copy_(0, idx, key[:, h])
+            v_rows.index_copy_(0, idx, value[:, h])
+        else:
+            k_rows.index_copy_(0, idx, key[:, h, e * d : (e + 1) * d])
+            v_rows.index_copy_(0, idx, value[:, h, e * d : (e + 1) * d])

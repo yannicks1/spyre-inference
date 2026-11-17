@@ -15,8 +15,15 @@
 """KV cache placement for Spyre's hybrid KV cache manager.
 
 Upstream overlays layer ``l`` of every group on one buffer viewed at each layer's shape; a
-Spyre tensor cannot be re-viewed at another shape (torch-spyre#3770), so those layers share
-one tensor per page shape instead (a ``KVCacheTensor`` with ``layer_stride=0``).
+Spyre tensor cannot be re-viewed at another stick width (torch-spyre#3770), so those layers
+share one tensor per page shape instead (a ``KVCacheTensor`` with ``layer_stride=0``).
+
+A layer whose blocks are larger than the slot's smallest folds into that slot's pages when a
+block holds as many elements as a page: with ``k * block_size``-token blocks of ``H`` heads
+of ``r * d``, its block ``b`` is pages ``k * b .. k * b + k - 1`` of the slot tensor viewed as
+``[k * num_blocks, H * r, block_size, d]``, page head ``e * H + h`` holding dims
+``[e * d, (e + 1) * d)`` of head ``h`` (gemma-4: a 256-token global block of 2 heads x 512
+is one 128-token sliding page of 8 heads x 256). Only outer dims are re-viewed.
 """
 
 from vllm.config import VllmConfig
@@ -64,19 +71,83 @@ def page_bytes(spec: KVCacheSpec) -> int:
     return getattr(spec, "real_page_size_bytes", spec.page_size_bytes)
 
 
+def page_fold(spec: KVCacheSpec, page: KVCacheSpec) -> tuple[int, int] | None:
+    """``(token_split, head_split)`` storing ``spec``'s blocks in ``page``-shaped pages, or None.
+
+    ``spec`` folds when its block is ``token_split`` pages and each head ``head_split`` page
+    heads, so the pages hold exactly its elements; ``(1, 1)`` is ``page`` itself.
+    """
+    if not (isinstance(spec, AttentionSpec) and isinstance(page, AttentionSpec)):
+        return None
+    head_size_v = getattr(spec, "head_size_v", spec.head_size)
+    page_head_size_v = getattr(page, "head_size_v", page.head_size)
+    if (
+        spec.dtype != page.dtype
+        or head_size_v != spec.head_size
+        or page_head_size_v != page.head_size
+        or spec.block_size % page.block_size
+        or spec.head_size % page.head_size
+    ):
+        return None
+    token_split = spec.block_size // page.block_size
+    head_split = spec.head_size // page.head_size
+    if spec.num_kv_heads * token_split * head_split != page.num_kv_heads:
+        return None
+    return token_split, head_split
+
+
 def spyre_kv_placement(
     kv_cache_groups: list[KVCacheGroupSpec],
 ) -> list[tuple[KVCacheSpec, list[str]]]:
-    """``(spec, layers)`` per Spyre allocation: layer ``l`` of every group, split by page shape."""
-    slots: dict[tuple, tuple[KVCacheSpec, list[str]]] = {}
+    """``(spec, layers)`` per Spyre allocation: layer ``l`` of every group, split by page shape.
+
+    ``spec`` is the page's own; a layer with larger blocks joins the first page of its slot
+    it folds into (``page_fold``).
+    """
+    by_slot: dict[int, list[tuple[str, KVCacheSpec]]] = {}
     for group in kv_cache_groups:
         if group.host_resident:
             continue
         for slot, layer_name in enumerate(group.layer_names):
-            spec = layer_spec(group, layer_name)
-            _, layers = slots.setdefault((slot, _page_shape(spec, layer_name)), (spec, []))
-            layers.append(layer_name)
-    return list(slots.values())
+            by_slot.setdefault(slot, []).append((layer_name, layer_spec(group, layer_name)))
+
+    placement: list[tuple[KVCacheSpec, list[str]]] = []
+    for layers in by_slot.values():
+        block_sizes = [s.block_size for _, s in layers if isinstance(s, AttentionSpec)]
+        smallest = min(block_sizes, default=None)
+        pages: dict[tuple, tuple[KVCacheSpec, list[str]]] = {}
+        folded: list[tuple[str, KVCacheSpec]] = []
+        for layer_name, spec in layers:
+            if isinstance(spec, AttentionSpec) and spec.block_size != smallest:
+                folded.append((layer_name, spec))
+                continue
+            pages.setdefault(_page_shape(spec, layer_name), (spec, []))[1].append(layer_name)
+        for layer_name, spec in folded:
+            target = next(
+                (entry for entry in pages.values() if page_fold(spec, entry[0]) is not None),
+                None,
+            )
+            if target is None:
+                target = pages.setdefault(_page_shape(spec, layer_name), (spec, []))
+            target[1].append(layer_name)
+        placement += pages.values()
+    return placement
+
+
+def folds_into_slot_pages(kv_cache_groups: list[KVCacheGroupSpec], block_size: int) -> bool:
+    """Whether every layer is stored in ``block_size``-token pages under ``spyre_kv_placement``."""
+    for page, layers in spyre_kv_placement(kv_cache_groups):
+        if not isinstance(page, AttentionSpec) or page.block_size != block_size:
+            return False
+        specs = {
+            name: layer_spec(group, name)
+            for group in kv_cache_groups
+            for name in group.layer_names
+            if name in layers
+        }
+        if any(page_fold(spec, page) is None for spec in specs.values()):
+            return False
+    return True
 
 
 class SpyreKVCacheConfigBuilder(DefaultKVCacheConfigBuilder):
@@ -95,8 +166,15 @@ class SpyreKVCacheConfigBuilder(DefaultKVCacheConfigBuilder):
             for name in group.layer_names
         ):
             return groups
-        # Upstream grows the smaller pages' block size to unify page sizes; the Spyre
-        # attention backend runs only cache_config.block_size, and needs no common page size.
+        # Upstream grows the smaller pages' block size to unify page sizes. Spyre attention
+        # splits a larger block into block_size pages, at upstream's footprint if it folds.
+        if folds_into_slot_pages(groups, block_size):
+            logger.info_once(
+                "Storing the KV cache's larger blocks as %d-token pages of their slots' "
+                "page shapes.",
+                block_size,
+            )
+            return groups
         logger.info_once(
             "Grouping the KV cache at block_size=%d with per-shape pages: the Spyre "
             "attention backend runs one block size.",

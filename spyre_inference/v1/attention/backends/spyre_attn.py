@@ -33,7 +33,12 @@ from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, ClassVar, NamedTuple, TypeVar
 
 import torch
-from vllm.config import CompilationMode, VllmConfig, get_current_vllm_config
+from vllm.config import (
+    CompilationMode,
+    VllmConfig,
+    get_current_vllm_config,
+    get_current_vllm_config_or_none,
+)
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import (
@@ -1467,10 +1472,19 @@ class SpyreAttentionBackend(AttentionBackend):
     def get_supported_kernel_block_sizes(
         kv_cache_spec: KVCacheSpec | None = None,
     ) -> list[int | MultipleOf]:
-        # `kv_cache_spec` is ignored: the stick constraint is the same for every spec.
         # Spyre stick size is 128 bytes; tensors are transferred as float16 (2 bytes),
         # so block_size must be a multiple of 64 (= 128 / 2) to satisfy stick alignment.
-        # This matches the constraint on head_size in supports_head_size().
+        # This matches the constraint on head_size in supports_head_size(). Bucketer, masks
+        # and warmup run cache_config.block_size, so a folded layer's larger block is split.
+        vllm_config = get_current_vllm_config_or_none()
+        block_size = None if vllm_config is None else vllm_config.cache_config.block_size
+        if (
+            block_size
+            and kv_cache_spec is not None
+            and kv_cache_spec.block_size != block_size
+            and kv_cache_spec.block_size % block_size == 0
+        ):
+            return [block_size]
         return [MultipleOf(64)]
 
     @staticmethod
@@ -1612,6 +1626,10 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # Only reached compiled: _batched_decode_supported declines it otherwise.
         self._decode_fn = _batched_decode_compiled
 
+        # Page heads per KV head of a layer folded into narrower pages (page_fold); set
+        # where its cache is bound.
+        self.head_split: int = 1
+
         self._kv_slots: SpyrePagedKVCache | None = None
         self._folded: SpyrePagedKVCache | None = None
         self._kv_row_pool_device: torch.Tensor | None = None
@@ -1752,6 +1770,10 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         k_pages, v_pages = kv_cache
         _target_device = k_pages.device
+        assert k_pages.shape[1] == self.num_kv_heads * self.head_split, (
+            f"pages hold {k_pages.shape[1]} heads for {self.num_kv_heads} KV heads at "
+            f"head_split={self.head_split}"
+        )
 
         # The mask stacks are mirrored lazily, by the only code that reads them: when
         # the batched kernel covers every decode sequence the per-sequence loop never
@@ -2080,18 +2102,18 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     def kv_write_index(
         self, slot_mapping: torch.Tensor, device: torch.device
     ) -> list[torch.Tensor]:
-        """Head h of the token at ``block * block_size + offset`` lives at row
-        ``(block * num_kv_heads + h) * block_size + offset``.
+        """Page head j of the token at ``block * block_size + offset`` lives at row
+        ``(block * page_heads + j) * block_size + offset``, ``page_heads`` being
+        ``num_kv_heads * head_split``.
 
         One tensor per head, not rows of one ``[KV, T]`` tensor: a row of a 2-D index is
         followed for its first int32 stick only (torch-spyre#3851), so every head drops the
         tokens past it -- a short-token test passes while long prefill corrupts.
         """
+        page_heads = self.num_kv_heads * self.head_split
         block = torch.div(slot_mapping, self.block_size, rounding_mode="floor")
-        base = block * self.num_kv_heads * self.block_size + slot_mapping % self.block_size
-        return [
-            convert(base + h * self.block_size, device=device) for h in range(self.num_kv_heads)
-        ]
+        base = block * page_heads * self.block_size + slot_mapping % self.block_size
+        return [convert(base + j * self.block_size, device=device) for j in range(page_heads)]
 
     def kv_slot_views(self, kv_cache: SpyrePagedKVCache) -> SpyrePagedKVCache:
         """One row per (block, kv_head, token), which is what ``kv_write_index`` indexes.
@@ -2115,7 +2137,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     def _kv_row_pool(self, num_pages: int, device: torch.device) -> torch.Tensor:
         """Every page's rows in the folded cache, for the decode kernel to gather from.
 
-        A page's rows are ``page * num_kv_heads + kv``. The kernel gathers
+        A page's rows are ``page * page_heads + j``. The kernel gathers
         them out of this pool rather than reading a per-block table, which also settles the
         question the unrolled walk had to work around: an index argument that is a row of
         a stacked table loses its layout (torch-spyre#3851,
@@ -2129,14 +2151,15 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         Uploaded page-outermost, as the gather needs it (torch-spyre#3705).
         """
         if self._kv_row_pool_device is None:
-            rows = torch.arange(num_pages * self.num_kv_heads, dtype=torch.int32)
+            page_heads = self.num_kv_heads * self.head_split
+            rows = torch.arange(num_pages * page_heads, dtype=torch.int32)
             layout = (
-                temporary_chunk_major_page_index_layout(num_pages, self.num_kv_heads)
+                temporary_chunk_major_page_index_layout(num_pages, page_heads)
                 if device.type == "spyre"
                 else None
             )
             self._kv_row_pool_device = convert(
-                rows.reshape(num_pages, self.num_kv_heads, 1), device=device, device_layout=layout
+                rows.reshape(num_pages, page_heads, 1), device=device, device_layout=layout
             )
         return self._kv_row_pool_device
 
@@ -2369,6 +2392,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             out=out,
             v_scale=v_scale,
             sinks=self._device_sinks(query_dev.device),
+            head_split=self.head_split,
         )
 
     def build_index_tables(
@@ -2434,6 +2458,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 v_scale=v_scale,
                 sinks=self._device_sinks(query.device),
                 page_group=_prefill_page_group(num_blocks, self.num_heads, self.head_size),
+                head_split=self.head_split,
             )
 
         k_folded, v_folded = self._folded_pages(k_pages, v_pages)
@@ -2461,6 +2486,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             out=out,
             v_scale=v_scale,
             sinks=self._device_sinks(query.device),
+            head_split=self.head_split,
         )
 
     @_record_function("spyre_attn::online_softmax")

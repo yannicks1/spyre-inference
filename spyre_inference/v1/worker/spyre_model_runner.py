@@ -1712,8 +1712,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
         chooses. The attention kernel selects a page by indexing with a one-element device
         tensor, so the page read is a real indirect access.
 
-        ``kernel_block_sizes`` is ignored: the backend accepts any 64-multiple, so the
-        kernel block size always equals the manager's.
+        ``kernel_block_sizes`` is not read: a layer whose blocks are split into smaller
+        kernel pages gets its view of the shared tensor from `allocate_spyre_kv_caches`.
         """
         from vllm.v1.worker.utils import bind_kv_cache
 

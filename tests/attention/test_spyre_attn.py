@@ -172,6 +172,8 @@ def _run_spyre_attn_test(
     expect_fused_store: bool | None = None,
     expect_query_widths: set[int] | None = None,
     num_blocks: int = 256,
+    head_split: int = 1,
+    scale: float | None = None,
 ) -> None:
     """Shared test body: validate SpyreAttentionImpl against a reference implementation.
 
@@ -197,7 +199,8 @@ def _run_spyre_attn_test(
     query_lens = [x[0] for x in seq_lens]
     kv_lens = [x[1] for x in seq_lens]
     assert num_query_heads % num_kv_heads == 0
-    scale = head_size**-0.5
+    if scale is None:
+        scale = head_size**-0.5
 
     query = torch.randn(sum(query_lens), num_query_heads, head_size, dtype=dtype)
     key = torch.randn(sum(query_lens), num_kv_heads, head_size, dtype=dtype)
@@ -274,6 +277,8 @@ def _run_spyre_attn_test(
         sinks=sinks,
     )
     assert attn_impl.block_size == block_size
+    # Each head is stored as head_split narrower page heads (kv_cache_config_builder.page_fold).
+    attn_impl.head_split = head_split
 
     # The fused store is just whether the kernel was handed an `out` buffer.
     fused_calls: list[bool] = []
@@ -295,7 +300,13 @@ def _run_spyre_attn_test(
     k_scale, v_scale = kv_scales
     attn_impl.prepare_kv_scales(Mock(_k_scale_float=k_scale, _v_scale_float=v_scale))
     k_pages, v_pages = _fresh_pages(
-        num_blocks, num_kv_heads, block_size, head_size, cache_device, dtype, fp8
+        num_blocks,
+        num_kv_heads * head_split,
+        block_size,
+        head_size // head_split,
+        cache_device,
+        dtype,
+        fp8,
     )
     kv_cache = SpyrePagedKVCache(k_pages=k_pages, v_pages=v_pages)
 
@@ -427,6 +438,34 @@ def test_spyre_attn_core(default_vllm_config, seq_lens, configure_compilation, c
         sliding_window=None,
         configure_compilation=configure_compilation,
         configure_device=configure_device,
+    )
+
+
+@pytest.mark.parametrize("batched_decode", ["1", "0"])
+@pytest.mark.parametrize("seq_lens", _SHAPES)
+@pytest.mark.parametrize(
+    ("configure_device", "configure_compilation"), _DEVICE_MODES, indirect=True
+)
+def test_spyre_attn_split_heads(
+    default_vllm_config,
+    monkeypatch,
+    seq_lens,
+    batched_decode,
+    configure_compilation,
+    configure_device,
+):
+    """gemma-4's global layers: 512-wide KV heads stored as two 256-wide page heads each."""
+    monkeypatch.setenv("SPYRE_BATCHED_DECODE", batched_decode)
+    _run_spyre_attn_test(
+        seq_lens=seq_lens,
+        block_size=128,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+        num_query_heads=16,
+        num_kv_heads=2,
+        head_size=512,
+        head_split=2,
     )
 
 
@@ -572,6 +611,21 @@ def test_kernel_block_sizes_accept_the_layer_spec():
         SpyreAttentionBackend.get_supported_kernel_block_sizes(),
     ):
         assert [s.base for s in sizes if isinstance(s, MultipleOf)] == [64]
+
+
+def test_a_larger_block_runs_as_cache_block_size_pages(default_vllm_config):
+    """A folded global layer keeps upstream's 256-token block; its kernel blocks are the
+    cache's 128-token pages, which upstream's block-table mapping then expands to."""
+    from vllm.config import get_current_vllm_config
+    from vllm.v1.kv_cache_interface import FullAttentionSpec
+    from vllm.v1.worker.utils import select_common_block_size
+
+    get_current_vllm_config().cache_config.block_size = 128
+    spec = FullAttentionSpec(block_size=256, num_kv_heads=2, head_size=512, dtype=torch.float16)
+    assert SpyreAttentionBackend.get_supported_kernel_block_sizes(spec) == [128]
+    assert select_common_block_size(256, [SpyreAttentionBackend], [spec]) == 128
+    native = FullAttentionSpec(block_size=128, num_kv_heads=2, head_size=512, dtype=torch.float16)
+    assert select_common_block_size(128, [SpyreAttentionBackend], [native]) == 128
 
 
 def test_block_size_validation():

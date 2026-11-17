@@ -29,6 +29,7 @@ Only the temporary softmax state grows; the permanent KV cache is unchanged.
 import torch
 
 from spyre_inference.v1.attention.ops.sinks import normalize
+from spyre_inference.v1.attention.ops.split_heads import split_pv, split_scores
 from spyre_inference.v1.attention.ops.tile_loop import USE_FOR_EACH_TILE, walk_tiles
 
 
@@ -43,12 +44,13 @@ def _entry_local_update(
     num_queries_per_kv,
     block_size,
     head_size,
+    head_split=1,
 ):
     """Update each slot's maximum, unnormalized sum and weighted-value sum."""
 
     def pv(probs):
-        return torch.matmul(
-            probs.reshape(entries, num_kv_heads, num_queries_per_kv, block_size), v_page
+        return _pv(
+            probs.reshape(entries, num_kv_heads, num_queries_per_kv, block_size), v_page, head_split
         ).reshape(blocks_per_chunk, num_seqs, num_kv_heads, num_queries_per_kv, head_size)
 
     # A slot can be masked in every chunk. A finite sentinel avoids -inf - -inf;
@@ -68,6 +70,12 @@ def _entry_local_update(
         tile_sum * rescale + torch.sum(probs, dim=-1, keepdim=True),
         tile_output * rescale + pv(probs),
     )
+
+
+def _pv(probs, v_page, head_split):
+    if head_split == 1:
+        return torch.matmul(probs, v_page)
+    return split_pv(probs, v_page, head_split, kv_axis=1)
 
 
 def _merge_entry_local(
@@ -113,6 +121,7 @@ def batched_decode_kernel(
     out=None,
     v_scale=None,
     sinks=None,
+    head_split=1,
 ):
     """Read head-major pages and compute one decode output per sequence/query head.
 
@@ -129,10 +138,13 @@ def batched_decode_kernel(
 
     A float8 page is cast to the query dtype after its gather and v_scale scales the
     output; the caller folds k_scale into ``scale``. sinks: [num_kv_heads,
-    num_queries_per_kv, 1] per-head sink logits, or None.
+    num_queries_per_kv, 1] per-head sink logits, or None. head_split: page heads per
+    KV head, ``head_size // head_split`` wide (see ``split_heads``).
     """
     num_heads = num_kv_heads * num_queries_per_kv
     entries = num_seqs * blocks_per_chunk
+    page_heads = num_kv_heads * head_split
+    page_head_size = head_size // head_split
     # Workaround walk only exists on the tiled path; the Python walk keeps #876's index.
     split_index = USE_FOR_EACH_TILE
     num_chunks = (
@@ -148,9 +160,10 @@ def batched_decode_kernel(
         """Sum the chunk's blocks; its slots share one max, so this needs no rescale."""
         chunk_sum = torch.sum(torch.sum(probs, dim=-1, keepdim=True), dim=0, keepdim=True)
         chunk_out = torch.sum(
-            torch.matmul(
+            _pv(
                 probs.reshape(entries, num_kv_heads, num_queries_per_kv, block_size),
                 v_page,
+                head_split,
             ).reshape(blocks_per_chunk, num_seqs, num_kv_heads, num_queries_per_kv, head_size),
             dim=0,
             keepdim=True,
@@ -166,12 +179,15 @@ def batched_decode_kernel(
         # Subscripting, not index_select: behind a 1-D index the entry axis splits only in
         # whole 32-entry sticks, and flattening the int32 tile first needs an unsupported
         # staging layout. Costs the eager path, which the preconditions decline.
-        k_page = k_pages[page_ids].reshape(entries, num_kv_heads, block_size, head_size)
-        v_page = v_pages[page_ids].reshape(entries, num_kv_heads, block_size, head_size)
+        k_page = k_pages[page_ids].reshape(entries, page_heads, block_size, page_head_size)
+        v_page = v_pages[page_ids].reshape(entries, page_heads, block_size, page_head_size)
         if k_page.dtype != q.dtype:
             k_page = k_page.to(q.dtype)
             v_page = v_page.to(q.dtype)
-        scores = torch.matmul(q, k_page.transpose(-2, -1)) * scale
+        if head_split == 1:
+            scores = torch.matmul(q, k_page.transpose(-2, -1)) * scale
+        else:
+            scores = split_scores(q, k_page, head_split, kv_axis=1) * scale
         if logits_soft_cap > 0.0:
             # Before the mask add: tanh(-inf/cap)*cap is -cap, not -inf, so
             # capping after it would un-mask the padded lanes.
@@ -195,6 +211,7 @@ def batched_decode_kernel(
                     num_queries_per_kv,
                     block_size,
                     head_size,
+                    head_split,
                 ),
                 None,
             )

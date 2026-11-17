@@ -25,6 +25,7 @@ does not have (torch-spyre#4123).
 import torch
 
 from spyre_inference.v1.attention.ops.sinks import normalize
+from spyre_inference.v1.attention.ops.split_heads import split_pv, split_scores
 from spyre_inference.v1.attention.ops.tile_loop import walk_tiles
 
 
@@ -48,6 +49,7 @@ def page_attn_decode_kernel(
     out=None,
     v_scale=None,
     sinks=None,
+    head_split=1,
 ):
     """Decode (Q=1) attention with the query groups folded into the row axis.
 
@@ -59,24 +61,29 @@ def page_attn_decode_kernel(
         query: [num_tokens, num_heads, head_size], the whole batch's query
         query_row_index: [padded_query_len] int32 device tensor of this sequence's
             absolute query rows.
-        k_pages / v_pages: [num_pages_total * num_kv_heads, block_size, head_size]
+        k_pages / v_pages: [num_pages_total * page_heads, block_size, head_size // head_split]
         page_index_table: [num_blocks, INT32_ELEMS_PER_STICK] int32 device tensor whose
             row i holds the i-th active block's page id in column 0, the base's table
             unchanged.
-        kv_row_pool: [num_pages_total, num_kv_heads, 1] int32 device tensor of every
-            page's folded-cache rows, ``page * num_kv_heads + kv``. Gathered rather than
-            sliced out of a per-block table (a row of a stacked index table reads wrong,
-            torch-spyre#3851). Pure cache geometry, so it is built once.
+        kv_row_pool: [num_pages_total, page_heads, 1] int32 device tensor of every
+            page's folded-cache rows, ``page * page_heads + j``, page_heads being
+            ``num_kv_heads * head_split``. Gathered rather than sliced out of a per-block
+            table (a row of a stacked index table reads wrong, torch-spyre#3851). Pure
+            cache geometry, so it is built once.
         mask_stack: [num_blocks, padded_query_len, block_size], tiled on dim 0.
         out: buffer to store into, or None to return the result instead.
         v_scale: float V scale of a float8 cache, None for a model-dtype one; the caller
             folds k_scale into ``scale``.
         sinks: [num_kv_heads, num_queries_per_kv, 1] per-head sink logits, or None.
+        head_split: page heads per KV head; the pages are ``head_size // head_split``
+            wide (see ``split_heads``).
 
     Returns [padded_query_len, num_heads, head_size], or ``out``.
     """
     assert padded_query_len == 1, "decode kernel is specialized for a single query row"
     num_queries_per_kv = num_heads // num_kv_heads
+    page_heads = num_kv_heads * head_split
+    page_head_size = head_size // head_split
 
     q = query.index_select(0, query_row_index).reshape(num_kv_heads, num_queries_per_kv, head_size)
 
@@ -89,13 +96,16 @@ def page_attn_decode_kernel(
         # Subscripting, not index_select, which takes only a 1-D index: that puts the entry
         # axis on the index's own stick axis, splittable only in whole 32-entry sticks.
         # [num_kv_heads, 1] lets the split land per kv head.
-        k_page = k_pages[kv_rows].reshape(num_kv_heads, block_size, head_size)
-        v_page = v_pages[kv_rows].reshape(num_kv_heads, block_size, head_size)
+        k_page = k_pages[kv_rows].reshape(page_heads, block_size, page_head_size)
+        v_page = v_pages[kv_rows].reshape(page_heads, block_size, page_head_size)
         if k_page.dtype != q.dtype:
             k_page = k_page.to(q.dtype)
             v_page = v_page.to(q.dtype)
 
-        scores = torch.matmul(q, k_page.permute(0, 2, 1)) * scale
+        if head_split == 1:
+            scores = torch.matmul(q, k_page.permute(0, 2, 1)) * scale
+        else:
+            scores = split_scores(q, k_page, head_split, kv_axis=0) * scale
         if logits_soft_cap > 0.0:
             # Before the mask add: tanh(-inf/cap)*cap is -cap, not -inf, so capping after
             # it would un-mask the padded lanes.
@@ -106,12 +116,17 @@ def page_attn_decode_kernel(
         scores_max = torch.amax(scores, dim=-1, keepdim=True)
 
         # `carry is None` is required for SPYRE_ATTN_FOR_EACH_TILE=0
+        def pv(probs):
+            if head_split == 1:
+                return torch.matmul(probs, v_page)
+            return split_pv(probs, v_page, head_split, kv_axis=0)
+
         if carry is None:
             probs = torch.exp(scores - scores_max)
             return (
                 scores_max,
                 probs.sum(dim=-1, keepdim=True),
-                torch.matmul(probs, v_page),
+                pv(probs),
             ), None
 
         tile_max, tile_sum, tile_output = carry
@@ -123,7 +138,7 @@ def page_attn_decode_kernel(
         return (
             new_max,
             tile_sum * rescale + probs.sum(dim=-1, keepdim=True),
-            tile_output * rescale + torch.matmul(probs, v_page),
+            tile_output * rescale + pv(probs),
         ), None
 
     state_shape = (num_kv_heads, num_queries_per_kv, 1)
