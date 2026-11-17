@@ -48,6 +48,10 @@ def register():
     if os.environ.get("FLEX_DEVICE") == "PF":
         for name in ("SPYRE_HAZARD_TRACKER", "SPYRE_HAZARD_COMPLETED_READS"):
             os.environ.setdefault(name, "1")
+    # MKL's vector math (host torch.cos and friends) otherwise returns different last bits
+    # from process to process, and so does the RoPE cos/sin cache built with it. MKL reads
+    # this on its first such call, which comes after this runs.
+    os.environ.setdefault("MKL_CBWR", "COMPATIBLE")
     return "spyre_inference.platform.TorchSpyrePlatform"
 
 
