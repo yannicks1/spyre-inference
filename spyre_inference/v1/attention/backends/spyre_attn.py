@@ -334,11 +334,14 @@ def _chunk_page_ids(
         block_ids_padded[:w, :n] = (bt[:, :w] * in_range).t()
     else:
         # Position i is the i-th ACTIVE block, matching the mask tiles.
-        for s, m in enumerate(members):
-            abs_blocks = active_block_indices[m]
-            n_use = min(len(abs_blocks), b_blocks)
-            for b, abs_b in enumerate(abs_blocks[:n_use]):
-                block_ids_padded[b, s] = bt[s, abs_b]
+        n_use_list = [min(len(active_block_indices[m]), b_blocks) for m in members]
+        w = max(n_use_list, default=0)
+        if w:
+            cols = torch.tensor(
+                [active_block_indices[m][:k] + [0] * (w - k) for m, k in zip(members, n_use_list)]
+            )
+            in_range = torch.arange(w).unsqueeze(0) < torch.tensor(n_use_list).unsqueeze(1)
+            block_ids_padded[:w, :n] = (bt.gather(1, cols) * in_range).t()
     return block_ids_padded
 
 
@@ -1298,17 +1301,14 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         assert metadata.attention_mask_stacks is not None
         num_active = [int(stack.shape[0]) for stack in metadata.attention_mask_stacks]
         active = metadata.active_block_indices
+        blocks_per_seq = (
+            num_active
+            if active is not None
+            else [(n + self.block_size - 1) // self.block_size for n in metadata.seq_lens.tolist()]
+        )
         chunk_page_ids_cpu = None
         if metadata.padded_num_seqs is not None:
             assert metadata.padded_batch_blocks is not None
-            blocks_per_seq = (
-                num_active
-                if active is not None
-                else [
-                    (int(n) + self.block_size - 1) // self.block_size
-                    for n in metadata.seq_lens.tolist()
-                ]
-            )
             n = metadata.num_decode_seqs
             b_blocks = self._attn_bucketer.find_batched_blocks_bucket(
                 max(blocks_per_seq[:n]), metadata.padded_num_seqs
@@ -1328,14 +1328,6 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             decode_groups = []
             for g in metadata.decode_groups:
                 members = g.rows_cpu.tolist()
-                blocks_per_seq = (
-                    num_active
-                    if active is not None
-                    else [
-                        (int(n) + self.block_size - 1) // self.block_size
-                        for n in metadata.seq_lens.tolist()
-                    ]
-                )
                 dblocks = [blocks_per_seq[m] for m in members]
                 b_blocks = self._attn_bucketer.find_blocks_bucket(max(dblocks))
                 assert b_blocks is not None
@@ -2260,34 +2252,80 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         assert group_out is not None
         store = output if output is out_staging else out_staging
         for group in attn_metadata.decode_groups:
-            if group.metadata is None:
-                group.metadata = replace(
-                    attn_metadata,
-                    num_decode_seqs=group.num_seqs,
-                    padded_num_seqs=group.padded_num_seqs,
-                    blocks_per_chunk=group.blocks_per_chunk,
-                    padded_batch_blocks=group.padded_batch_blocks,
-                    rep_row_ids_cpu=group.rep_row_ids_cpu,
-                    rep_row_ids_dev=None,
-                    chunk_page_ids_cpu=group.chunk_page_ids_cpu,
-                    chunk_page_ids_dev=None,
-                    mask_by_chunk_cpu=group.mask_by_chunk_cpu,
-                    mask_by_chunk_dev=None,
-                    decode_groups=None,
-                )
-                self._mirror_batched_decode_indices(group.metadata, device)
-                group.rows_dev = convert(
-                    self._group_store_rows(group.rows_cpu.tolist(), group.padded_num_seqs),
-                    device=device,
-                )
+            self._mirror_decode_group(attn_metadata, group, device)
+            assert group.metadata is not None and group.rows_dev is not None
             self._run_batched_decode_dispatch(
                 query_dev, k_pages, v_pages, group.metadata, group_out
             )
-            assert group.rows_dev is not None
             _scatter_rows_compiled(store, group.rows_dev, group_out)
         if store is not output:
             num_decode_seqs = attn_metadata.num_decode_seqs
             output[:num_decode_seqs].copy_(store[:num_decode_seqs].clone())
+
+    def _mirror_decode_group(
+        self,
+        attn_metadata: SpyreAttentionMetadata,
+        group: BatchedDecodeGroup,
+        device: torch.device,
+    ) -> None:
+        if group.metadata is not None:
+            return
+        metadata = replace(
+            attn_metadata,
+            num_decode_seqs=group.num_seqs,
+            padded_num_seqs=group.padded_num_seqs,
+            blocks_per_chunk=group.blocks_per_chunk,
+            padded_batch_blocks=group.padded_batch_blocks,
+            rep_row_ids_cpu=group.rep_row_ids_cpu,
+            rep_row_ids_dev=None,
+            chunk_page_ids_cpu=group.chunk_page_ids_cpu,
+            chunk_page_ids_dev=None,
+            mask_by_chunk_cpu=group.mask_by_chunk_cpu,
+            mask_by_chunk_dev=None,
+            decode_groups=None,
+        )
+        self._mirror_batched_decode_indices(metadata, device)
+        group.metadata = metadata
+        group.rows_dev = convert(
+            self._group_store_rows(group.rows_cpu.tolist(), group.padded_num_seqs),
+            device=device,
+        )
+
+    def prefetch_mirrors(
+        self, attn_metadata: SpyreAttentionMetadata, kv_cache: SpyrePagedKVCache
+    ) -> None:
+        """Upload what ``forward`` would mirror on its first layer, before the forward starts.
+
+        A convert waits for every queued device launch; here the queue is still empty."""
+        k_pages = kv_cache[0]
+        device = k_pages.device
+        if self._grouped_decode_preconditions_met(attn_metadata, k_pages):
+            assert attn_metadata.decode_groups is not None
+            for group in attn_metadata.decode_groups:
+                self._mirror_decode_group(attn_metadata, group, device)
+            batched_done = True
+        elif self._batched_decode_preconditions_met(attn_metadata, k_pages):
+            if attn_metadata.rep_row_ids_dev is None:
+                self._mirror_batched_decode_indices(attn_metadata, device)
+            batched_done = True
+        else:
+            batched_done = False
+        num_seqs = attn_metadata.num_seqs
+        seq_start = attn_metadata.num_decode_seqs if batched_done else 0
+        if seq_start == num_seqs:
+            return
+        self.index_tables(attn_metadata, device)
+        stacks = attn_metadata.attention_mask_stacks
+        assert stacks is not None
+        for seq_idx in range(seq_start, num_seqs):
+            if stacks[seq_idx].numel():
+                _mirror_mask_stack(attn_metadata, seq_idx, device)
+        if attn_metadata.query_row_tables is None:
+            attn_metadata.query_row_tables = _mirror_once(
+                attn_metadata,
+                attn_metadata.aligned_query_lens,
+                lambda: _build_query_row_tables(attn_metadata, device),
+            )
 
     def _group_store_rows(self, rows: list[int], padded_num_seqs: int) -> torch.Tensor:
         # Padded to the seq bucket so the store compiles once per bucket; padding writes the

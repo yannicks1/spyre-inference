@@ -73,6 +73,8 @@ from spyre_inference.models.roberta import offset_host_positions, roberta_positi
 from spyre_inference.multimodal import apply_multimodal_patches
 from spyre_inference.v1.attention import attn_layer
 from spyre_inference.v1.attention.backends.spyre_attn import (
+    SpyreAttentionImpl,
+    SpyreAttentionMetadata,
     SpyreAttentionMetadataBuilder,
     SpyrePagedKVCache,
     allocate_staging_buffers,
@@ -162,23 +164,83 @@ def _compute_slot_mapping_impl(
     (test_causal_backend_correctness) and end-to-end model generation tests.
     """
     assert TOTAL_CP_WORLD_SIZE == 1, "Context Parallelism is not supported on Spyre."
+    flat_indices, block_offsets = _slot_mapping_terms(
+        num_tokens, query_start_loc, positions, KV_CACHE_BLOCK_SIZE, block_table_stride
+    )
+    _write_slot_mapping(
+        slot_mapping,
+        block_table,
+        flat_indices,
+        block_offsets,
+        KV_CACHE_BLOCK_SIZE,
+        num_tokens,
+        max_num_tokens,
+        PAD_ID,
+    )
 
+
+def _slot_mapping_terms(
+    num_tokens: int,
+    query_start_loc: torch.Tensor,
+    positions: torch.Tensor,
+    block_size: int,
+    block_table_stride: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
     token_positions = positions[:num_tokens]
-    block_indices = (token_positions // KV_CACHE_BLOCK_SIZE).to(torch.int64)
-    block_offsets = (token_positions % KV_CACHE_BLOCK_SIZE).to(torch.int64)
+    block_indices = (token_positions // block_size).to(torch.int64)
+    block_offsets = (token_positions % block_size).to(torch.int64)
 
     num_reqs = query_start_loc.shape[0] - 1
-    req_indices = torch.empty(num_tokens, dtype=torch.int64, device=positions.device)
-    for i in range(num_reqs):
-        start = query_start_loc[i].item()
-        end = query_start_loc[i + 1].item()
-        req_indices[start:end] = i
+    req_indices = torch.zeros(num_tokens, dtype=torch.int64, device=positions.device)
+    owned = torch.repeat_interleave(
+        torch.arange(num_reqs, device=positions.device), query_start_loc.diff()
+    )[:num_tokens]
+    req_indices[: owned.shape[0]] = owned
+    return req_indices * block_table_stride + block_indices, block_offsets
 
-    flat_indices = req_indices * block_table_stride + block_indices
+
+def _write_slot_mapping(
+    slot_mapping: torch.Tensor,
+    block_table: torch.Tensor,
+    flat_indices: torch.Tensor,
+    block_offsets: torch.Tensor,
+    block_size: int,
+    num_tokens: int,
+    max_num_tokens: int,
+    pad_id: int = _PAD_SLOT_ID,
+) -> None:
     block_numbers = block_table.flatten()[flat_indices].to(torch.int64)
-    slot_mapping[:num_tokens] = block_numbers * KV_CACHE_BLOCK_SIZE + block_offsets
+    slot_mapping[:num_tokens] = block_numbers * block_size + block_offsets
     if num_tokens < max_num_tokens:
-        slot_mapping[num_tokens:max_num_tokens] = PAD_ID
+        slot_mapping[num_tokens:max_num_tokens] = pad_id
+
+
+def _compute_group_slot_mappings(
+    self: Any, num_reqs: int, query_start_loc: torch.Tensor, positions: torch.Tensor
+) -> None:
+    """``MultiGroupBlockTable.compute_slot_mapping``; groups map the same tokens, so the
+    per-token terms are computed once per block size."""
+    from vllm.v1.worker.block_table import SlotMappingMode
+
+    num_tokens = positions.shape[0]
+    terms: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]] = {}
+    for table in self.block_tables:
+        if table.slot_mapping_mode == SlotMappingMode.NONE:
+            continue
+        assert table.slot_mapping_mode == SlotMappingMode.TOKEN_TO_KV_SLOT
+        assert table.dcp_world_size == 1, "Context Parallelism is not supported on Spyre."
+        block_table = table.block_table.gpu
+        key = (table.block_size, block_table.stride(0))
+        if key not in terms:
+            terms[key] = _slot_mapping_terms(num_tokens, query_start_loc, positions, *key)
+        _write_slot_mapping(
+            table.slot_mapping.gpu,
+            block_table,
+            *terms[key],
+            table.block_size,
+            num_tokens,
+            table.max_num_batched_tokens,
+        )
 
 
 class _SlotMappingKernelShim:
@@ -244,6 +306,7 @@ def _patch_compute_slot_mapping() -> None:
         )
 
     setattr(block_table, _SLOT_MAPPING_KERNEL_ATTR, _compute_slot_mapping_kernel)
+    block_table.MultiGroupBlockTable.compute_slot_mapping = _compute_group_slot_mappings
 
 
 class SpyreCpuGpuBuffer(CpuGpuBuffer):
@@ -1217,6 +1280,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         """
         out = super()._build_attention_metadata(*args, **kwargs)
         if self.model_config.runner_type != "pooling":
+            self._prefetch_attention_mirrors(out)
             return out
         from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
             EncoderRectPlan,
@@ -1265,6 +1329,28 @@ class TorchSpyreModelRunner(GPUModelRunner):
         )
         self.spyre_encoder_stats.record(plan, rows)
         return out
+
+    def _prefetch_attention_mirrors(self, out: Any) -> None:
+        """``SpyreAttentionImpl.prefetch_mirrors`` once per KV cache group's metadata."""
+        per_layer = out[0] if isinstance(out, tuple) else out
+        static_ctx = self.compilation_config.static_forward_context
+        done: set[int] = set()
+        for metadata_by_layer in per_layer if isinstance(per_layer, list) else [per_layer]:
+            for layer_name, metadata in metadata_by_layer.items():
+                # Encoder-only metadata has no mask stacks.
+                if (
+                    id(metadata) in done
+                    or not isinstance(metadata, SpyreAttentionMetadata)
+                    or metadata.attention_mask_stacks is None
+                ):
+                    continue
+                layer = static_ctx.get(layer_name)
+                impl = getattr(layer, "impl", None)
+                kv_cache = getattr(layer, "kv_cache", None)
+                if type(impl) is not SpyreAttentionImpl or not kv_cache:
+                    continue
+                impl.prefetch_mirrors(metadata, kv_cache)
+                done.add(id(metadata))
 
     def _determine_batch_execution_and_padding(
         self,

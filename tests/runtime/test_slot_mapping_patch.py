@@ -138,3 +138,39 @@ def test_shim_computes_the_slot_mapping_through_a_real_block_table():
         dtype=torch.int64,
     )
     torch.testing.assert_close(table.slot_mapping.gpu[:4], expected)
+
+
+def test_multi_group_slot_mapping_matches_each_group_alone():
+    """The shared per-token terms give every group the slots its own table would."""
+    from vllm.v1.worker import block_table
+
+    _patch_compute_slot_mapping()
+
+    block_sizes, max_tokens = [16, 16, 32], 16
+    tables = block_table.MultiGroupBlockTable(
+        max_num_reqs=2,
+        max_num_batched_tokens=max_tokens,
+        pin_memory=False,
+        device=torch.device("cpu"),
+        block_sizes=block_sizes,
+        max_num_blocks=[8, 8, 4],
+    )
+    tables.add_row(([7, 3, 5], [1, 9, 2], [4, 6]), row_idx=0)
+    tables.add_row(([2, 8], [11, 12], [10]), row_idx=1)
+    tables.commit_block_table(num_reqs=2)
+
+    positions = torch.tensor([14, 15, 16, 17, 33, 3, 4], dtype=torch.int64)
+    query_start_loc = torch.tensor([0, 5, 7], dtype=torch.int32)
+    tables.compute_slot_mapping(2, query_start_loc, positions)
+
+    for table in tables.block_tables:
+        shared = table.slot_mapping.gpu.clone()
+        table.slot_mapping.gpu.fill_(0)
+        table.compute_slot_mapping(2, query_start_loc, positions)
+        torch.testing.assert_close(shared, table.slot_mapping.gpu)
+    torch.testing.assert_close(
+        tables.block_tables[2].slot_mapping.gpu[:7],
+        torch.tensor(
+            [4 * 32 + p for p in (14, 15, 16, 17)] + [6 * 32 + 1, 10 * 32 + 3, 10 * 32 + 4]
+        ),
+    )

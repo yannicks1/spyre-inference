@@ -172,6 +172,7 @@ def _run_spyre_attn_test(
     expect_fused_store: bool | None = None,
     expect_query_widths: set[int] | None = None,
     num_blocks: int = 256,
+    prefetch: bool = False,
 ) -> None:
     """Shared test body: validate SpyreAttentionImpl against a reference implementation.
 
@@ -337,6 +338,8 @@ def _run_spyre_attn_test(
     # NaN, not empty: every row is expected to be written, so a store that lands nowhere
     # fails below instead of passing on whatever the allocator gave.
     output = torch.full_like(query, float("nan")).to(cache_device)
+    if prefetch:
+        attn_impl.prefetch_mirrors(attn_metadata, kv_cache)
     attn_impl.forward(
         layer=None,
         query=convert(query, cache_device),
@@ -427,6 +430,25 @@ def test_spyre_attn_core(default_vllm_config, seq_lens, configure_compilation, c
         sliding_window=None,
         configure_compilation=configure_compilation,
         configure_device=configure_device,
+    )
+
+
+@pytest.mark.parametrize("seq_lens", _SHAPES)
+@pytest.mark.parametrize("sliding_window", [None, 128])
+@pytest.mark.parametrize(
+    ("configure_device", "configure_compilation"), _DEVICE_MODES, indirect=True
+)
+def test_spyre_attn_prefetched_mirrors(
+    default_vllm_config, seq_lens, sliding_window, configure_compilation, configure_device
+):
+    """A forward over metadata the runner pre-mirrored reads what it would have built."""
+    _run_spyre_attn_test(
+        seq_lens=seq_lens,
+        block_size=128,
+        sliding_window=sliding_window,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+        prefetch=True,
     )
 
 
