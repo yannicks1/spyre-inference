@@ -316,9 +316,10 @@ Each Spyre layer allocates its own page per block, so the budget is converted in
 at the device cost of all layers' pages. That is more than vLLM's shared pool counts when
 groups would overlay one buffer, as a Mamba hybrid's do. Every layer's K and V pages are
 one tensor each, and the Spyre allocator never splits a tensor across its 16 GiB memory
-regions, so a model with few layers gets fewer blocks than its budget: they must still pack
-into the regions. When memory runs out before a full batch fits, a warning names the knobs,
-and requests wait for pages instead of all running at full length.
+regions, so a model with few layers gets the blocks whose tensors pack into the regions'
+free ranges after loading, which can be fewer than its budget. When memory runs out before
+a full batch fits, a warning names the knobs, and requests wait for pages instead of all
+running at full length.
 
 The profile run is skipped, as the first forward on Spyre would trace the model before
 the KV cache exists: a forward's activations come out of the `1 - --gpu-memory-utilization`

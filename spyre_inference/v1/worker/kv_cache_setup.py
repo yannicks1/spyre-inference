@@ -118,14 +118,21 @@ def allocate_spyre_kv_caches(
     # A KVCacheTensor lists several layers; sharing one page buffer among them
     # would let each layer's KV write clobber the others'.
     num_blocks = kv_cache_config.num_blocks
-    for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-        for layer_name in kv_cache_tensor.layers:
-            spec = spec_by_layer[layer_name]
-            # The layout belongs to the backend; a layer without an impl (fixture
-            # stubs) gets the default decoder layout.
-            impl = getattr(static_ctx.get(layer_name), "impl", None)
-            impl_cls = type(impl) if isinstance(impl, SpyreAttentionImpl) else SpyreAttentionImpl
-            kv_caches[layer_name] = impl_cls.allocate_pages(num_blocks, spec, device)
+    layer_names = [ln for t in kv_cache_config.kv_cache_tensors for ln in t.layers]
+    # Largest pages first: TorchSpyreWorker._region_safe_blocks sized the cache for that order.
+    layer_names.sort(
+        key=lambda ln: getattr(
+            spec_by_layer[ln], "real_page_size_bytes", spec_by_layer[ln].page_size_bytes
+        ),
+        reverse=True,
+    )
+    for layer_name in layer_names:
+        spec = spec_by_layer[layer_name]
+        # The layout belongs to the backend; a layer without an impl (fixture
+        # stubs) gets the default decoder layout.
+        impl = getattr(static_ctx.get(layer_name), "impl", None)
+        impl_cls = type(impl) if isinstance(impl, SpyreAttentionImpl) else SpyreAttentionImpl
+        kv_caches[layer_name] = impl_cls.allocate_pages(num_blocks, spec, device)
 
     for layer_name, target in shared_layers.items():
         kv_caches[layer_name] = kv_caches[target]
