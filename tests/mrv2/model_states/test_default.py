@@ -50,7 +50,11 @@ def _fields_read(*functions) -> set[str]:
 
 
 # build() also hands the metadata to split_decodes_and_prefills.
-_BUILDER_FIELDS = _fields_read(SpyreAttentionMetadataBuilder.build, split_decodes_and_prefills)
+_BUILDER_FIELDS = _fields_read(
+    SpyreAttentionMetadataBuilder.build,
+    SpyreAttentionMetadataBuilder._build,
+    split_decodes_and_prefills,
+)
 
 
 class _Recorder:
