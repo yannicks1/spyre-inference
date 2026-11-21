@@ -104,6 +104,9 @@ _STAGED_UPLOAD_DTYPES = (torch.int64, torch.float16)
 def _async_source(tensor: torch.Tensor, owned: bool) -> torch.Tensor:
     if owned or tensor.dtype in _STAGED_UPLOAD_DTYPES:
         return tensor
+    if tensor.is_pinned():
+        # A pageable clone would lose torch-spyre's pre-mapped pinned DMA path.
+        return torch.empty_like(tensor, pin_memory=True).copy_(tensor)
     return tensor.clone()
 
 

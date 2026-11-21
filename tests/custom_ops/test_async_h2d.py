@@ -66,20 +66,30 @@ def test_layout_convert_falls_back_to_tensor_to(source, device, dtype, monkeypat
     assert layouts == [sentinel]
 
 
+def test_async_source_keeps_pinned_copies_pinned():
+    if not spyre_available():
+        pytest.skip("Spyre device not available")
+    src = torch.zeros(8, dtype=torch.int32).pin_memory()
+    copy = _async_source(src, owned=False)
+    assert copy.is_pinned() and copy.data_ptr() != src.data_ptr()
+
+
 @pytest.mark.parametrize(
-    "layout,dtype",
+    "layout,dtype,pinned",
     [
-        (False, torch.int32),
-        (False, torch.float32),
+        pytest.param(False, torch.int32, False, id="convert-int32"),
+        pytest.param(False, torch.float32, False, id="convert-fp32"),
         # Passed through uncloned: these fail if torch-spyre stops staging them.
-        (False, torch.int64),
-        (False, torch.float16),
-        (True, torch.int32),
+        pytest.param(False, torch.int64, False, id="convert-int64"),
+        pytest.param(False, torch.float16, False, id="convert-fp16"),
+        pytest.param(True, torch.int32, False, id="layout-int32"),
+        pytest.param(True, torch.float16, False, id="layout-fp16"),
+        pytest.param(False, torch.int32, True, id="convert-int32-pinned"),
+        pytest.param(True, torch.int32, True, id="layout-int32-pinned"),
     ],
-    ids=["convert-int32", "convert-fp32", "convert-int64", "convert-fp16", "layout-int32"],
 )
-def test_upload_ignores_source_rewrite_after_enqueue(layout, dtype):
-    """A caller rewriting its buffer while the upload is queued must not reach the card."""
+def test_upload_ignores_source_rewrite_after_enqueue(layout, dtype, pinned):
+    """Neither the caller rewriting its buffer nor a reuse of a freed copy may reach the card."""
     if not spyre_available():
         pytest.skip("Spyre device not available")
     from spyre_inference.custom_ops import utils
@@ -95,6 +105,8 @@ def test_upload_ignores_source_rewrite_after_enqueue(layout, dtype):
         # Two whole sticks: a same-format upload of this size skips torch-spyre's staging.
         n = 128 // dtype.itemsize * 2
         src = torch.arange(n, dtype=dtype) + 40
+        if pinned:
+            src = src.pin_memory()
         want = src.clone()
         for _ in range(40):
             mm(a)
@@ -107,5 +119,8 @@ def test_upload_ignores_source_rewrite_after_enqueue(layout, dtype):
         else:
             dst = utils.convert(src, device=dev)
         src.fill_(POISON)
+        # Same-size allocations can land on the block of a copy freed after enqueue.
+        reused = [torch.full((n,), POISON, dtype=dtype, pin_memory=pinned) for _ in range(4)]
         torch.spyre.synchronize()
         assert torch.equal(dst.cpu().reshape(-1), want)
+        del reused
