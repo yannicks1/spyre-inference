@@ -475,6 +475,54 @@ __attribute__((always_inline)) static inline void for_each_above(
     if (kInclusive ? buf[j] >= threshold : buf[j] > threshold) f(j, buf[j]);
 }
 
+// min(init, the least buf[i] > threshold).
+__attribute__((always_inline)) static inline float min_above(const float* buf,
+                                                             int n,
+                                                             float threshold,
+                                                             float init) {
+  float m = init;
+  int j = 0;
+#if defined(__AVX512F__)
+  const __m512 cutoff = _mm512_set1_ps(threshold);
+  __m512 acc = _mm512_set1_ps(init);
+  for (; j + 16 <= n; j += 16) {
+    const __m512 v = _mm512_loadu_ps(buf + j);
+    acc = _mm512_mask_min_ps(acc, _mm512_cmp_ps_mask(v, cutoff, _CMP_GT_OQ),
+                             acc, v);
+  }
+  m = _mm512_reduce_min_ps(acc);
+#elif defined(__AVX2__)
+  const __m256 cutoff = _mm256_set1_ps(threshold);
+  const __m256 big = _mm256_set1_ps(init);
+  __m256 acc0 = big, acc1 = big;
+  for (; j + 16 <= n; j += 16) {
+    const __m256 a = _mm256_loadu_ps(buf + j);
+    const __m256 b = _mm256_loadu_ps(buf + j + 8);
+    acc0 = _mm256_min_ps(
+        acc0, _mm256_blendv_ps(big, a, _mm256_cmp_ps(a, cutoff, _CMP_GT_OQ)));
+    acc1 = _mm256_min_ps(
+        acc1, _mm256_blendv_ps(big, b, _mm256_cmp_ps(b, cutoff, _CMP_GT_OQ)));
+  }
+  alignas(32) float lanes[8];
+  _mm256_store_ps(lanes, _mm256_min_ps(acc0, acc1));
+  for (float v : lanes) m = std::min(m, v);
+#elif defined(__powerpc__) || defined(__s390x__)
+  const vf32 cutoff = vec_splats(threshold);
+  const vf32 big = vec_splats(init);
+  vf32 acc = big;
+  for (; j + 16 <= n; j += 16) {
+    for (int r = 0; r < 4; ++r) {
+      const vf32 v = vec_xl(0, buf + j + 4 * r);
+      acc = vec_min(acc, vec_sel(big, v, vec_cmpgt(v, cutoff)));
+    }
+  }
+  m = hmin_f32(acc);
+#endif
+  for (; j < n; ++j)
+    if (buf[j] > threshold) m = std::min(m, buf[j]);
+  return m;
+}
+
 __attribute__((always_inline)) static inline int gather_outliers(
     const float* buf, int n, float threshold, float* out, double* sum_out) {
   int m = 0;
@@ -610,9 +658,7 @@ static float binary_search_buffer(const float* buf, int n, float p_val,
   }
   // At the iteration cap, hi can still lie between stored probabilities.
   // The least value above lo keeps at least p mass, with a disjoint tie group.
-  float boundary = hi;
-  for_each_above(buf, n, lo,
-                 [&](int, float v) { boundary = std::min(boundary, v); });
+  float boundary = min_above(buf, n, lo, hi);
   if (boundary != hi) s_hi = sum_gt_to_double(buf, n, boundary);
   *sum_above_out = s_hi;
   return boundary;
