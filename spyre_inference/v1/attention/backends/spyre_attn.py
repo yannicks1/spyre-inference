@@ -1444,14 +1444,14 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         if metadata.padded_num_seqs is not None:
             assert metadata.padded_batch_blocks is not None
             n = metadata.num_decode_seqs
-            b_blocks = self._attn_bucketer.find_batched_blocks_bucket(
-                max(blocks_per_seq[:n]), metadata.padded_num_seqs
+            plan = self._attn_bucketer.batched_decode_plan(
+                metadata.padded_num_seqs, max(blocks_per_seq[:n])
             )
-            assert b_blocks is not None
+            assert plan is not None
             chunk_page_ids_cpu = _chunk_page_ids(
                 list(range(n)),
                 metadata.padded_num_seqs,
-                b_blocks,
+                plan.num_blocks,
                 metadata.padded_batch_blocks,
                 blocks_per_seq[:n],
                 blk_table,
@@ -1463,12 +1463,12 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             for g in metadata.decode_groups:
                 members = g.rows_cpu.tolist()
                 dblocks = [blocks_per_seq[m] for m in members]
-                b_blocks = self._attn_bucketer.find_blocks_bucket(max(dblocks))
-                assert b_blocks is not None
+                plan = self._attn_bucketer.batched_decode_plan(g.padded_num_seqs, max(dblocks))
+                assert plan is not None
                 chunk_ids = _chunk_page_ids(
                     members,
                     g.padded_num_seqs,
-                    b_blocks,
+                    plan.num_blocks,
                     g.padded_batch_blocks,
                     dblocks,
                     blk_table,
