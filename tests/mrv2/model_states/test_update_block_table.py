@@ -13,8 +13,9 @@
 # limitations under the License.
 
 """update_block_table(build(table A), table B) equals build(table B), field by field; only
-builders whose metadata vLLM can key on spec and builder type opt into it; and prepare_attn
-shares metadata across same-spec groups as vLLM's runner does once it gates on that flag."""
+builders whose metadata vLLM can key on spec and builder type opt into it; the metadata it
+derives share their device copies; and prepare_attn shares metadata across same-spec groups as
+vLLM's runner does once it gates on that flag."""
 
 import dataclasses
 from types import SimpleNamespace
@@ -32,6 +33,7 @@ from vllm.v1.worker.utils import AttentionGroup
 
 from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionMetadataBuilder,
+    _mirror_mask_stack,
     reuse_metadata_across_groups,
 )
 from spyre_inference.v1.worker.spyre.model_states.default import SpyreDefaultModelState
@@ -121,6 +123,23 @@ def test_update_block_table_matches_build(
     ref = b1.build(0, cb)
     for f in dataclasses.fields(ref):
         _eq(getattr(upd, f.name), getattr(ref, f.name), f.name)
+
+
+@pytest.mark.parametrize("window", [None, 512])
+def test_rebound_metadata_shares_device_copies(default_vllm_config, window):
+    """A mask stack is copied to the device once for a build and every metadata
+    update_block_table derives from it; the page IDs stay each metadata's own."""
+    bt_a, bt_b = (torch.randint(1, 5000, (2, 16), dtype=torch.int32) for _ in range(2))
+    c = _common([1, 1], [1100, 1300], bt_a)
+    md_a = _builder(window).build(0, c)
+    md_b = _builder(window).update_block_table(md_a, bt_b, c.slot_mapping)
+    other = _builder(window).build(0, c)
+    cpu = torch.device("cpu")
+    for s in range(2):
+        mirrored = _mirror_mask_stack(md_a, s, cpu)
+        assert _mirror_mask_stack(md_b, s, cpu) is mirrored
+        assert _mirror_mask_stack(other, s, cpu) is not mirrored
+        assert md_b.page_index_tables_cpu[s] is not md_a.page_index_tables_cpu[s]
 
 
 def test_shared_build_needs_scope_and_spec(default_vllm_config):
