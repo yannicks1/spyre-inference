@@ -19,13 +19,16 @@ import ast
 import inspect
 import textwrap
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 import torch.nn as nn
+from vllm.config import get_current_vllm_config
 from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
+from vllm.v1.kv_cache_interface import SlidingWindowSpec
 from vllm.v1.worker.utils import AttentionGroup
 
 from spyre_inference.v1.attention.backends.spyre_attn import SpyreAttentionMetadataBuilder
@@ -38,7 +41,7 @@ def _fields_read(*functions) -> set[str]:
     """Every ``common_attn_metadata.<field>`` the functions' source reads."""
     fields: set[str] = set()
     for function in functions:
-        tree = ast.parse(textwrap.dedent(inspect.getsource(function)))
+        tree = ast.parse(textwrap.dedent(inspect.getsource(inspect.unwrap(function))))
         for node in ast.walk(tree):
             if (
                 isinstance(node, ast.Attribute)
@@ -52,7 +55,6 @@ def _fields_read(*functions) -> set[str]:
 # build() also hands the metadata to split_decodes_and_prefills.
 _BUILDER_FIELDS = _fields_read(
     SpyreAttentionMetadataBuilder.build,
-    SpyreAttentionMetadataBuilder._build,
     split_decodes_and_prefills,
 )
 
@@ -126,3 +128,74 @@ def test_values_match_the_step():
     assert (common.max_query_len, common.max_seq_len) == (5, 21)
     assert common.block_table_tensor is block_tables[0]
     assert common.causal is True
+
+
+def test_prepare_attn_reuses_same_spec_groups_only_within_step(default_vllm_config, monkeypatch):
+    cfg = get_current_vllm_config()
+    cfg.model_config.get_num_attention_heads = Mock(return_value=4)
+    cfg.model_config.get_num_kv_heads = Mock(return_value=1)
+    cfg.cache_config.block_size = 128
+    cfg.model_config.max_model_len = 2048
+    spec = SlidingWindowSpec(
+        block_size=128, num_kv_heads=1, head_size=256, dtype=torch.float16, sliding_window=512
+    )
+    state = SpyreDefaultModelState(
+        make_config(max_model_len=2048),  # ty: ignore[invalid-argument-type]
+        nn.Module(),
+        None,
+        torch.device("cpu"),
+        torch.device("cpu"),
+    )
+    builders = [
+        SpyreAttentionMetadataBuilder(spec, [f"layer.{i}"], cfg, torch.device("cpu"))
+        for i in range(3)
+    ]
+    updates, publications = [], []
+    groups = []
+    for i, builder in enumerate(builders):
+        updates.append(Mock(wraps=builder.update_block_table))
+        publications.append(Mock(wraps=builder.publish_slot_mapping))
+        monkeypatch.setattr(builder, "update_block_table", updates[-1])
+        monkeypatch.setattr(builder, "publish_slot_mapping", publications[-1])
+        groups.append(
+            [
+                AttentionGroup(
+                    backend=None,  # ty: ignore[invalid-argument-type]
+                    layer_names=[f"layer.{i}"],
+                    kv_cache_spec=spec,
+                    kv_cache_group_id=i,
+                    metadata_builders=[builder],
+                )
+            ]
+        )
+    batch = make_input_batch([1, 1, 64], num_computed=[1000, 1200, 600])
+    tables = tuple(torch.arange(48, dtype=torch.int32).reshape(3, 16) + 100 * i for i in range(3))
+    slots = torch.arange(3 * 66, dtype=torch.int64).reshape(3, 66)
+    kv_config = SimpleNamespace(kv_cache_groups=[None] * 3)
+
+    first_masks = None
+    for invocation in range(2):
+        metadata = state.prepare_attn(
+            batch,
+            CUDAGraphMode.NONE,
+            tables,
+            slots,
+            groups,
+            kv_config,  # ty: ignore[invalid-argument-type]
+        )
+        assert [update.call_count for update in updates] == [0, invocation + 1, invocation + 1]
+        masks = metadata["layer.0"].attention_mask_stacks
+        assert masks is not first_masks
+        for i in range(3):
+            item = metadata[f"layer.{i}"]
+            assert item.attention_mask_stacks is masks
+            assert item.block_table is tables[i]
+            assert torch.equal(item.slot_mapping, slots[i])
+            assert publications[i].call_count == invocation + 1
+            assert torch.equal(publications[i].call_args.args[0], slots[i])
+            if i:
+                assert item is not metadata["layer.0"]
+                assert not torch.equal(
+                    item.page_index_tables_cpu[0], metadata["layer.0"].page_index_tables_cpu[0]
+                )
+        first_masks = masks

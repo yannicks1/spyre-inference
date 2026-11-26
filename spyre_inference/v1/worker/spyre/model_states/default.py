@@ -14,23 +14,50 @@
 
 """MRV2: decoder model state (vllm/v1/worker/gpu/model_states/default.py:DefaultModelState).
 
-Upstream's prepare_inputs is used as-is; bucketing.py pads the body. prepare_attn shares
-one metadata build across KV cache groups of one spec.
+Upstream's prepare_inputs is used as-is; bucketing.py pads the body.
 """
 
 from typing import Any
 
+import torch
+from vllm.config.compilation import CUDAGraphMode
+from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
+from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
+from vllm.v1.worker.utils import AttentionGroup
 
-from spyre_inference.v1.attention.backends.spyre_attn import share_metadata_across_groups
+from spyre_inference.v1.attention.metadata_reuse_compat import StepMetadata
 from spyre_inference.v1.worker.spyre.model_states.base import SpyreModelStateMixin
 
 
 class SpyreDefaultModelState(SpyreModelStateMixin, DefaultModelState):
     """MRV2: DefaultModelState, constructed with the Spyre device."""
 
-    def prepare_attn(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
-        # Upstream rebinds metadata across same-spec groups for Mamba only; the hybrid
-        # manager's sliding-window groups differ in their block tables alone too.
-        with share_metadata_across_groups():
-            return super().prepare_attn(*args, **kwargs)
+    def prepare_attn(
+        self,
+        input_batch: InputBatch,
+        cudagraph_mode: CUDAGraphMode,
+        block_tables: tuple[torch.Tensor, ...],
+        slot_mappings: torch.Tensor,
+        attn_groups: list[list[AttentionGroup]],
+        kv_cache_config: KVCacheConfig,
+        for_capture: bool = False,
+        ubatch_idx: int = 0,
+        model_specific_attn_metadata: ModelSpecificAttnMetadata | None = None,
+    ) -> dict[str, Any]:
+        # Delete this override when upstream owns ordinary-attention reuse.
+        provider = model_specific_attn_metadata
+        if provider is None and not for_capture and cudagraph_mode != CUDAGraphMode.FULL:
+            provider = StepMetadata()
+        return super().prepare_attn(
+            input_batch,
+            cudagraph_mode,
+            block_tables,
+            slot_mappings,
+            attn_groups,
+            kv_cache_config,
+            for_capture=for_capture,
+            ubatch_idx=ubatch_idx,
+            model_specific_attn_metadata=provider,
+        )

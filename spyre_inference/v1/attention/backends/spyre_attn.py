@@ -27,9 +27,9 @@ import contextlib
 import functools
 import math
 import time
-from collections.abc import Callable, Iterator
-from contextvars import ContextVar, copy_context
-from dataclasses import dataclass, field, fields, replace
+from collections.abc import Callable
+from contextvars import copy_context
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, TypeVar
 
 import torch
@@ -54,6 +54,7 @@ from vllm.v1.kv_cache_layout import KVCacheLayout
 from spyre_inference import envs
 from spyre_inference.custom_ops.utils import convert, row_outermost_layout
 from spyre_inference.v1.attention import attn_layer
+from spyre_inference.v1.attention.metadata_reuse_compat import reuse_attention_metadata
 from spyre_inference.v1.attention.ops.batched_decode import (
     batched_decode_kernel,
 )
@@ -444,39 +445,6 @@ def _chunk_page_ids(
             for b, abs_b in enumerate(abs_blocks[:n_use]):
                 block_ids_padded[b, s] = bt[s, abs_b]
     return block_ids_padded
-
-
-# One build_attn_metadata call's builds, by builder key: (common metadata, metadata).
-_group_builds: ContextVar[dict | None] = ContextVar("spyre_group_builds", default=None)
-
-# Fields upstream sets per KV cache group; every other field is the batch's.
-_PER_GROUP_FIELDS = frozenset({"block_table_tensor", "slot_mapping"})
-
-
-@contextlib.contextmanager
-def share_metadata_across_groups() -> Iterator[None]:
-    """Within the scope, a builder whose spec equals an earlier one's rebinds that
-    builder's metadata to its own block table (``update_block_table``) instead of
-    building it again: KV cache groups of one spec differ only in their pages."""
-    token = _group_builds.set({})
-    try:
-        yield
-    finally:
-        _group_builds.reset(token)
-
-
-def _same_batch(a: CommonAttentionMetadata, b: CommonAttentionMetadata) -> bool:
-    # Tensors by identity: within one build_attn_metadata call the groups get the same
-    # objects, and the cached entry keeps them alive so an id cannot be reused.
-    for f in fields(a):
-        if f.name in _PER_GROUP_FIELDS or f.name.startswith("_"):
-            continue
-        x, y = getattr(a, f.name), getattr(b, f.name)
-        if x is y:
-            continue
-        if not isinstance(x, (bool, int, float, str)) or type(x) is not type(y) or x != y:
-            return False
-    return True
 
 
 @dataclass
@@ -994,6 +962,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
 
         return active_bs, tiles
 
+    @reuse_attention_metadata
     def build(
         self,
         common_prefix_len: int,
@@ -1002,33 +971,6 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         per_seq_only: bool = False,
     ) -> SpyreAttentionMetadata:
         """Build attention metadata from common metadata."""
-        builds = _group_builds.get()
-        if builds is None or per_seq_only or self._encoder_only:
-            return self._build(common_prefix_len, common_attn_metadata, per_seq_only)
-        key = (
-            type(self),
-            self.kv_cache_spec,
-            self.sliding_window,
-            self.num_kv_heads,
-            self.causal_override,
-            self.reorder_batch_threshold,
-            common_prefix_len,
-        )
-        hit = builds.get(key)
-        if hit is not None and _same_batch(hit[0], common_attn_metadata):
-            return self.update_block_table(
-                hit[1], common_attn_metadata.block_table_tensor, common_attn_metadata.slot_mapping
-            )
-        metadata = self._build(common_prefix_len, common_attn_metadata, per_seq_only)
-        builds[key] = (common_attn_metadata, metadata)
-        return metadata
-
-    def _build(
-        self,
-        common_prefix_len: int,
-        common_attn_metadata: CommonAttentionMetadata,
-        per_seq_only: bool,
-    ) -> SpyreAttentionMetadata:
         seq_lens = common_attn_metadata.seq_lens
         query_start_loc = common_attn_metadata.query_start_loc
         max_seq_len = common_attn_metadata.max_seq_len
@@ -1471,6 +1413,11 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
     def publish_slot_mapping(self, slot_mapping: torch.Tensor) -> None:
         """Set the KV-write slots this builder's layers read on their next forward."""
         self._slot_mapping.publish(slot_mapping)
+
+    @property
+    def supports_update_block_table(self) -> bool:
+        # The upstream key omits a draft's causal_override; encoders have no pages.
+        return not self._encoder_only and self.causal_override is None
 
     def update_block_table(
         self,

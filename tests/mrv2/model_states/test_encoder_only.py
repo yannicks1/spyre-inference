@@ -71,11 +71,10 @@ class _EncoderBuilder:
         common = copy(common_attn_metadata)
         common.causal = self.causal
         fake_self = SimpleNamespace(_encoder_only=True, block_size=64, num_kv_heads=1, num_heads=4)
-        return SpyreAttentionMetadataBuilder._build(
+        return SpyreAttentionMetadataBuilder.build(
             fake_self,  # ty: ignore[invalid-argument-type]
             common_prefix_len,
             common,
-            per_seq_only=False,
         )
 
 
