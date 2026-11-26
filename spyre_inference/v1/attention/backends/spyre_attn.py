@@ -183,6 +183,22 @@ def _to_device_with_page_range(
     return dev.resize_(host.shape)
 
 
+_T = TypeVar("_T")
+
+
+def _mirror_once(
+    attn_metadata: "SpyreAttentionMetadata", host: object, upload: Callable[[], _T]
+) -> _T:
+    """``upload()``'s device copy of ``host``, made once per build and shared by every
+    metadata update_block_table derives from it: those hold the same host objects."""
+    entry = attn_metadata.mirror_cache.get(id(host))
+    # The entry holds ``host`` so that its id is not reused while the entry exists.
+    if entry is None or entry[0] is not host:
+        entry = (host, upload())
+        attn_metadata.mirror_cache[id(host)] = entry
+    return entry[1]
+
+
 def _mirror_mask_stack(
     attn_metadata: "SpyreAttentionMetadata", seq_idx: int, device: torch.device
 ) -> torch.Tensor:
@@ -199,25 +215,28 @@ def _mirror_mask_stack(
 
     stack_device = stacks_device[seq_idx]
     if stack_device is None:
-        _, query_rows, block_size = stack_cpu.shape
-        # Singleton strides must match between recorded and serving masks.
-        stack_cpu = stack_cpu.contiguous().as_strided(
-            stack_cpu.shape, (query_rows * block_size, block_size, 1)
-        )
         page_range = attn_metadata.seq_page_range(seq_idx)
-        if page_range is not None and device.type == "spyre":
-            # Pages outermost make the real pages a prefix of the reservation, so only they
-            # are copied; the default layout scatters them (torch-spyre#6026).
-            layout = row_outermost_layout(
-                (page_range["max"], query_rows, block_size), stack_cpu.dtype
+
+        def upload() -> torch.Tensor:
+            _, query_rows, block_size = stack_cpu.shape
+            # Singleton strides must match between recorded and serving masks.
+            strided = stack_cpu.contiguous().as_strided(
+                stack_cpu.shape, (query_rows * block_size, block_size, 1)
             )
-            stack_device = stack_cpu.to(  # ty: ignore[no-matching-overload]
-                device, dynamic={0: page_range}, device_layout=layout
-            )
-        else:
+            if page_range is not None and device.type == "spyre":
+                # Pages outermost make the real pages a prefix of the reservation, so only
+                # they are copied; the default layout scatters them (torch-spyre#6026).
+                layout = row_outermost_layout(
+                    (page_range["max"], query_rows, block_size), strided.dtype
+                )
+                return strided.to(  # ty: ignore[no-matching-overload]
+                    device, dynamic={0: page_range}, device_layout=layout
+                )
             # `convert` copies, so even a nonzero-offset host view arrives contiguous at
             # offset 0, ready for an in-graph dim-0 slice.
-            stack_device = convert(stack_cpu, device=device)
+            return convert(strided, device=device)
+
+        stack_device = _mirror_once(attn_metadata, stack_cpu, upload)
         stacks_device[seq_idx] = stack_device
     return stack_device
 
@@ -344,7 +363,6 @@ _SPYRE_CORES = 32
 _LX_ATTN_CORES = 8
 _PAGE_GROUP = 8
 _PAGE_GROUP_MAX_QUERY_WIDTH = 1024
-_T = TypeVar("_T")
 _F = TypeVar("_F", bound=Callable[..., Any])
 
 
@@ -615,6 +633,10 @@ class SpyreAttentionMetadata(AttentionMetadata):
     # copied to the device with this range. None for a kernel with a fixed chunk count.
     chunk_range: DynamicRange | None = None
     decode_groups: list[BatchedDecodeGroup] | None = None
+
+    # Device copies of host tensors by host object (_mirror_once). update_block_table's
+    # metadata keep this dict, so the masks and row tables they share cross once per step.
+    mirror_cache: dict[int, tuple[object, Any]] = field(default_factory=dict)
 
     # Which one it is *is* the path selection: one rectangle for the dense path, a list
     # of groups for the ragged one. Imported under TYPE_CHECKING only -- the encoder
@@ -2452,9 +2474,13 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                     decode_groups=None,
                 )
                 self._mirror_batched_decode_indices(group.metadata, device)
-                group.rows_dev = convert(
-                    self._group_store_rows(group.rows_cpu.tolist(), group.padded_num_seqs),
-                    device=device,
+                group.rows_dev = _mirror_once(
+                    attn_metadata,
+                    group.rows_cpu,
+                    lambda g=group: convert(
+                        self._group_store_rows(g.rows_cpu.tolist(), g.padded_num_seqs),
+                        device=device,
+                    ),
                 )
             self._run_batched_decode_dispatch(
                 query_dev, k_pages, v_pages, group.metadata, group_out
@@ -2478,7 +2504,11 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         assert attn_metadata.rep_row_ids_cpu is not None
         assert attn_metadata.chunk_page_ids_cpu is not None
         assert attn_metadata.mask_by_chunk_cpu is not None
-        attn_metadata.rep_row_ids_dev = convert(attn_metadata.rep_row_ids_cpu, device=device)
+        attn_metadata.rep_row_ids_dev = _mirror_once(
+            attn_metadata,
+            attn_metadata.rep_row_ids_cpu,
+            lambda: convert(attn_metadata.rep_row_ids_cpu, device=device),
+        )
         # TEMPORARY until torch-spyre#4603 is validated: each page ID gets its own
         # stick. Preserve the CPU metadata shapes used by the recorder and dispatch.
         b = attn_metadata.padded_num_seqs
@@ -2510,14 +2540,20 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             attn_metadata.chunk_page_ids_dev = idx.to(  # ty: ignore[no-matching-overload]
                 device, dynamic=dynamic, device_layout=idx_layout
             )
-            attn_metadata.mask_by_chunk_dev = mask.to(  # ty: ignore[no-matching-overload]
-                device, dynamic=dynamic, device_layout=mask_layout
+            attn_metadata.mask_by_chunk_dev = _mirror_once(
+                attn_metadata,
+                attn_metadata.mask_by_chunk_cpu,
+                lambda: mask.to(  # ty: ignore[no-matching-overload]
+                    device, dynamic=dynamic, device_layout=mask_layout
+                ),
             )
             return
         attn_metadata.chunk_page_ids_dev = convert(
             idx, device=device, device_layout=temporary_chunk_major_page_index_layout(c, e)
         )
-        attn_metadata.mask_by_chunk_dev = convert(mask, device=device)
+        attn_metadata.mask_by_chunk_dev = _mirror_once(
+            attn_metadata, attn_metadata.mask_by_chunk_cpu, lambda: convert(mask, device=device)
+        )
 
     def _run_batched_decode(
         self,
@@ -2778,8 +2814,10 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             assert index_table.shape[0] == len(active_bs)
 
             if attn_metadata.query_row_tables is None:
-                attn_metadata.query_row_tables = _build_query_row_tables(
-                    attn_metadata, _target_device
+                attn_metadata.query_row_tables = _mirror_once(
+                    attn_metadata,
+                    attn_metadata.aligned_query_lens,
+                    lambda: _build_query_row_tables(attn_metadata, _target_device),
                 )
             row_table = attn_metadata.query_row_tables[seq_idx]
 
